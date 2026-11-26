@@ -1,0 +1,6 @@
+anthropic
+feedparser
+requests
+trafilatura
+telethon
+beautifulsoup4
