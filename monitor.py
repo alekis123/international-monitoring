@@ -75,6 +75,7 @@ MSK = dt.timezone(dt.timedelta(hours=3))  # weekday logic uses Moscow time
 # Tajikistan, Moldova, Ghana, Madagascar, Guinea, Guinea-Bissau, India.
 
 _RU = '(Russia OR Russian OR Kremlin OR Moscow)'
+_ACT_SHORT = '(visit OR talks OR delegation OR forum)'
 _ACT = ('(visit OR visiting OR talks OR delegation OR meeting OR "will meet" OR "intergovernmental commission" '
         'OR "joint commission" OR "intergovernmental committee" OR "co-chair")')
 
@@ -82,16 +83,18 @@ _ACT = ('(visit OR visiting OR talks OR delegation OR meeting OR "will meet" OR 
 # Each query returns at most 250 articles, so the topic is split across several.
 GDELT_QUERIES = [
     f'{_RU} (visit OR visiting OR "will visit" OR "official visit" OR "state visit" OR "working visit")',
-    f'{_RU} (talks OR delegation OR "intergovernmental commission" OR "joint commission" OR "intergovernmental committee" '
-    'OR "will meet" OR "bilateral meeting" OR "co-chair")',
-    '(Putin OR Mishustin OR Lavrov OR Siluanov OR Manturov OR Novak OR Overchuk OR Belousov OR Reshetnikov '
-    'OR Shoigu OR Matviyenko OR Volodin OR Nabiullina OR Ushakov) (visit OR talks OR meet OR trip)',
-    # Priority countries, in groups
-    f'{_RU} {_ACT} (China OR "Hong Kong" OR Taiwan OR Macao OR Macau OR Vietnam OR Cambodia OR Thailand OR Myanmar OR Japan)',
-    f'{_RU} {_ACT} ("South Korea" OR "North Korea" OR DPRK OR Indonesia OR Singapore OR Laos OR Malaysia OR Mongolia OR India)',
-    f'{_RU} {_ACT} (Brazil OR "South Africa" OR Nigeria OR Mexico OR Guyana OR Jamaica OR Ghana OR Madagascar OR Guinea OR "Guinea-Bissau")',
-    f'{_RU} {_ACT} (Turkey OR Turkiye OR Azerbaijan OR Bahrain OR Qatar OR Kuwait OR UAE OR Emirates OR Oman OR "Saudi Arabia" OR Egypt OR Morocco OR Algeria)',
-    f'{_RU} {_ACT} (Armenia OR Hungary OR Slovakia OR Serbia OR Belarus OR Kazakhstan OR Uzbekistan OR Turkmenistan OR Kyrgyzstan OR Tajikistan OR Moldova)',
+    f'{_RU} (talks OR delegation OR "intergovernmental commission" OR "joint commission" OR "will meet")',
+    '(Putin OR Mishustin OR Lavrov OR Siluanov OR Manturov OR Novak OR Overchuk) (visit OR talks OR forum OR summit)',
+    '(Belousov OR Reshetnikov OR Shoigu OR Matviyenko OR Volodin OR Ushakov OR Dmitriev) (visit OR talks OR forum OR summit)',
+    # Priority countries, in small groups (GDELT rejects very long queries)
+    f'{_RU} {_ACT_SHORT} (China OR "Hong Kong" OR Taiwan OR Macao OR Vietnam OR Cambodia)',
+    f'{_RU} {_ACT_SHORT} (Thailand OR Myanmar OR Japan OR "South Korea" OR "North Korea" OR Laos)',
+    f'{_RU} {_ACT_SHORT} (Indonesia OR Singapore OR Malaysia OR Mongolia OR India)',
+    f'{_RU} {_ACT_SHORT} (Brazil OR "South Africa" OR Nigeria OR Mexico OR Guyana OR Jamaica)',
+    f'{_RU} {_ACT_SHORT} (Ghana OR Madagascar OR Guinea OR "Guinea-Bissau" OR Egypt OR Morocco OR Algeria)',
+    f'{_RU} {_ACT_SHORT} (Turkey OR Azerbaijan OR Armenia OR Bahrain OR Qatar OR Kuwait)',
+    f'{_RU} {_ACT_SHORT} (UAE OR Oman OR "Saudi Arabia" OR Hungary OR Slovakia OR Serbia)',
+    f'{_RU} {_ACT_SHORT} (Belarus OR Kazakhstan OR Uzbekistan OR Turkmenistan OR Kyrgyzstan OR Tajikistan OR Moldova)',
 ]
 # Search windows: from the last successful run (plus a safety margin), at least 1 hour, at most 2 days.
 # Set at the start of each run, so a skipped or delayed GitHub run never leaves a gap.
@@ -211,7 +214,7 @@ NEWS_LINK_RE = r"/(news|novost|press|presscenter|press-center|events|media|activ
 # CORE channels: every post goes to the AI. Channels from telegram_channels.csv (ministries,
 # agencies, embassies, consulates, trade missions...): only posts containing visit/meeting
 # words go to the AI, which saves the free AI quota. Edit the CSV to add or remove channels.
-TG_CORE = ["MID_Russia", "MariaVladimirovnaZakharova", "tass_agency", "rian_ru", "interfaxonline", "pool_n3"]
+TG_CORE = ["MID_Russia", "MariaVladimirovnaZakharova", "tass_agency", "rian_ru", "interfaxonline"]
 TG_MAX_PAGES = 10   # busy channels: read up to 10 x ~20 older posts to reach the last post already seen
 TG_CHANNELS_FILE = os.environ.get("TG_CHANNELS_FILE") or "telegram_channels.csv"
 
@@ -221,7 +224,7 @@ def load_tg_channels():
     import csv
     labels = {"mid_russia": "МИД России", "tass_agency": "ТАСС", "rian_ru": "РИА Новости",
               "mariavladimirovnazakharova": "Мария Захарова, официальный представитель МИД",
-              "interfaxonline": "Интерфакс", "pool_n3": "Кремлёвский пул (Пул N3)"}
+              "interfaxonline": "Интерфакс"}
     order = list(TG_CORE)
     try:
         with open(TG_CHANNELS_FILE, encoding="utf-8-sig") as f:
@@ -329,22 +332,29 @@ def fetch_gdelt():
     for q in GDELT_QUERIES:
         params = {"query": q, "mode": "artlist", "format": "json", "maxrecords": "250",
                   "timespan": f"{WINDOW_HOURS}h", "sort": "datedesc"}
-        try:
-            r = requests.get("https://api.gdeltproject.org/api/v2/doc/doc",
-                             params=params, headers=UA, timeout=60)
-            data = r.json() if r.text.strip().startswith("{") else {}
-            if not data:
-                print(f"[gdelt] non-JSON reply for query starting '{q[:60]}': {r.text[:150]}")
-        except Exception as e:
-            print(f"[gdelt error] {e}")
-            data = {}
+        data = {}
+        for attempt in range(3):
+            try:
+                r = requests.get("https://api.gdeltproject.org/api/v2/doc/doc",
+                                 params=params, headers=UA, timeout=60)
+                if r.text.strip().startswith("{"):
+                    data = r.json()
+                    break
+                if "limit requests" in r.text and attempt < 2:
+                    time.sleep(15 * (attempt + 1))   # GDELT is busy (GitHub shares IP addresses)
+                    continue
+                print(f"[gdelt] no results for query starting '{q[:60]}': {r.text[:120]}")
+                break
+            except Exception as e:
+                print(f"[gdelt error] {e}")
+                break
         for a in data.get("articles", []):
             items.append({
                 "source": f"{a.get('domain', '')} ({a.get('sourcecountry', '')}, {a.get('language', '')})",
                 "title": a.get("title", ""), "text": "", "url": a.get("url", ""),
                 "uid": a.get("url", ""), "published": from_gdelt(a.get("seendate")),
             })
-        time.sleep(6)  # GDELT asks for gentle request rates
+        time.sleep(8)  # GDELT asks for at most one request every 5 seconds
     HEALTH["GDELT"] = len(items)
     return items
 
@@ -427,7 +437,14 @@ def _read_page(src):
         flt = src.get("filter", True)
         base = {"source": src["name"], "channel": "page:" + src["name"], "keyword_filter": flt}
         try:
-            r = requests.get(src["url"], headers=UA, timeout=30)
+            try:
+                r = requests.get(src["url"], headers=UA, timeout=(10, 30))
+            except requests.exceptions.SSLError:
+                # many .gov.ru sites use Russian state certificates that foreign servers don't trust;
+                # we only read public news pages, so retry without the certificate check
+                import urllib3
+                urllib3.disable_warnings()
+                r = requests.get(src["url"], headers=UA, timeout=(10, 30), verify=False)
             soup = BeautifulSoup(r.content, "html.parser")
 
             # 1) RSS feed advertised by the page
@@ -1070,8 +1087,22 @@ def link(url, text):
     return f'<a href="{html.escape(url or "", quote=True)}">{e(text)}</a>'
 
 
+LAST_TG_ERROR = {}
+DELIVERY = {"ok": 0, "failed": 0, "last_error": ""}
+
+
+def chat_id():
+    """The chat to send to. When Telegram turns a group into a 'supergroup', the group gets a NEW id;
+    the bot then switches to it automatically (and asks you to update the TELEGRAM_CHAT_ID secret)."""
+    env = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+    mig = json.loads(meta_get("chat_migration") or "{}")
+    return mig.get("to") if mig.get("from") == env else env
+
+
 def tg(method, payload=None, files=None):
     """Call the Telegram Bot API; returns the 'result' or None."""
+    global LAST_TG_ERROR
+    LAST_TG_ERROR = {}
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     try:
         if files:
@@ -1080,6 +1111,7 @@ def tg(method, payload=None, files=None):
             r = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload or {}, timeout=30)
         body = r.json()
         if not body.get("ok"):
+            LAST_TG_ERROR = body
             print(f"[telegram {method} error] {r.status_code} {body.get('description')}")
             return None
         return body.get("result")
@@ -1090,14 +1122,89 @@ def tg(method, payload=None, files=None):
 
 def send(text_html, reply_to=None, markup=None):
     """Send an HTML message; returns its message_id (or None)."""
-    payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text_html[:4096],
+    payload = {"chat_id": chat_id(), "text": text_html[:4096],
                "parse_mode": "HTML", "disable_web_page_preview": True}
     if reply_to:
         payload["reply_parameters"] = {"message_id": int(reply_to), "allow_sending_without_reply": True}
     if markup:
         payload["reply_markup"] = markup
     res = tg("sendMessage", payload)
-    return res.get("message_id") if res else None
+    new_id = ((LAST_TG_ERROR.get("parameters") or {}).get("migrate_to_chat_id")) if not res else None
+    if new_id:
+        # The group became a supergroup: remember the new id and resend
+        old = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+        meta_set("chat_migration", json.dumps({"from": old, "to": str(new_id)}))
+        print(f"[telegram] group moved to new id {new_id}; switching automatically")
+        payload["chat_id"] = str(new_id)
+        payload.pop("reply_parameters", None)
+        res = tg("sendMessage", payload)
+        if res and not meta_get("chat_migration_notice"):
+            tg("sendMessage", {"chat_id": str(new_id), "parse_mode": "HTML", "text":
+                "ℹ️ <b>Telegram сменил ID этой группы</b> (группа стала «супергруппой»). Бот переключился "
+                f"на новый ID автоматически.\nПожалуйста, обновите секрет <code>TELEGRAM_CHAT_ID</code> на GitHub: "
+                f"<code>{new_id}</code>"})
+            meta_set("chat_migration_notice", "1")
+    if res:
+        DELIVERY["ok"] += 1
+        return res.get("message_id")
+    DELIVERY["failed"] += 1
+    DELIVERY["last_error"] = LAST_TG_ERROR.get("description", "network error")
+    return None
+
+
+def register_commands():
+    """Show /check in Telegram's command menu (once)."""
+    if meta_get("commands_v1"):
+        return
+    ok = tg("setMyCommands", {"commands": [
+        {"command": "check", "description": "Проверить ссылку: /check https://..."}]})
+    if ok:
+        meta_set("commands_v1", "1")
+
+
+def alert_message_from_row(row):
+    """Rebuild an alert from the database (for alerts that were not delivered)."""
+    lines = [f"🛬 <b>Анонс визита</b>" + (f": Россия ⇄ {e(row['countries'])}" if row["countries"] else ""), "",
+             e(row["summary"]), ""]
+    if row["officials"]:
+        lines.append(f"👤 <b>Кто:</b> {e(row['officials'])}")
+    if row["direction"]:
+        lines.append(f"🧭 <b>Направление:</b> {e(DIRECTION_RU.get(row['direction'], row['direction']))}")
+    if row["location"]:
+        lines.append(f"📍 <b>Где:</b> {e(row['location'])}")
+    when = row["date_label"] or row["event_date"] or "не указано"
+    if row["date_text"]:
+        when += f" (в тексте: «{row['date_text']}»)"
+    lines += [f"📅 <b>Когда:</b> {e(when)}", "",
+              f"🔗 {link(row['url'], (row['title_ru'] or row['summary'] or row['url'])[:200])}"
+              + (f" — {e(row['source'])}" if row["source"] else "")]
+    return "\n".join(lines)
+
+
+def redeliver_undelivered():
+    """Alerts saved but never delivered (e.g. while the chat ID was wrong): send them now.
+    Only events that are not over yet; each alert is retried at most 3 times."""
+    today = dt.datetime.now(MSK).date().isoformat()
+    rows = db.execute(
+        "SELECT * FROM alerts WHERE msg_id IS NULL AND COALESCE(status,'active') IN ('active','postponed') "
+        "AND ts > ? AND (date_end IS NULL OR date_end >= ?) ORDER BY id LIMIT 60",
+        (time.time() - 10 * 86400, today)).fetchall()
+    tries = json.loads(meta_get("redeliver_tries") or "{}")
+    rows = [r for r in rows if tries.get(str(r["id"]), 0) < 3]
+    if not rows:
+        return
+    first = send(f"📬 <b>Оповещения, которые не удалось доставить раньше</b> ({len(rows)}).\n"
+                 f"Причина: Telegram сменил ID группы, и сообщения не доходили. Ниже — все ещё актуальные события.")
+    if not first:
+        return
+    for r in rows:
+        mid = send(alert_message_from_row(r), markup=fb_markup(r["id"]) if FEEDBACK_ON else None)
+        tries[str(r["id"])] = tries.get(str(r["id"]), 0) + 1
+        if mid:
+            db.execute("UPDATE alerts SET msg_id=? WHERE id=?", (mid, r["id"]))
+        time.sleep(0.5)
+    db.commit()
+    meta_set("redeliver_tries", json.dumps(tries))
 
 
 def fb_markup(alert_id, vote=None):
@@ -1232,11 +1339,17 @@ def process_feedback():
     offset = int(meta_get("tg_offset") or 0)
     updates = tg("getUpdates", {"offset": offset, "timeout": 0}) or []
     checks = json.loads(meta_get("manual_checks") or "[]")
-    my_chat = str(os.environ["TELEGRAM_CHAT_ID"])
+    my_chats = {str(os.environ["TELEGRAM_CHAT_ID"]).strip(), chat_id()}
     for u in updates:
         offset = max(offset, u["update_id"] + 1)
         msg = u.get("message") or u.get("channel_post")
-        if msg and str(msg.get("chat", {}).get("id")) == my_chat:
+        mig = (msg or {}).get("migrate_to_chat_id")
+        if mig and str(msg["chat"]["id"]) in my_chats:
+            meta_set("chat_migration", json.dumps({"from": str(os.environ["TELEGRAM_CHAT_ID"]).strip(), "to": str(mig)}))
+            print(f"[telegram] group moved to new id {mig}")
+            my_chats.add(str(mig))
+            continue
+        if msg and str(msg.get("chat", {}).get("id")) in my_chats:
             text = msg.get("text") or msg.get("caption") or ""
             if re.match(r"^/(check|проверь)\b", text.strip(), re.I) or msg["chat"].get("type") == "private":
                 for url in re.findall(r"https?://\S+", text)[:5]:
@@ -1292,7 +1405,7 @@ def remove_buttons_if_disabled():
         return
     if meta_get("buttons_removed"):
         return
-    chat = os.environ["TELEGRAM_CHAT_ID"]
+    chat = chat_id()
     for row in db.execute("SELECT msg_id FROM alerts WHERE msg_id IS NOT NULL").fetchall():
         tg("editMessageReplyMarkup", {"chat_id": chat, "message_id": row["msg_id"],
                                       "reply_markup": {"inline_keyboard": []}})
@@ -1456,7 +1569,7 @@ def send_archive():
             w.writerow(vals)
     name = f"архив_визитов_{dt.datetime.now(MSK).date().isoformat()}.csv"
     with open(path, "rb") as f:
-        tg("sendDocument", {"chat_id": os.environ["TELEGRAM_CHAT_ID"],
+        tg("sendDocument", {"chat_id": chat_id(),
                             "caption": f"🗂 Архив всех оповещений ({len(rows)}). Открывается в Excel."},
            files={"document": (name, f, "text/csv")})
 
@@ -1488,9 +1601,12 @@ def run_once():
 
     try:
         process_feedback()
+        register_commands()
         remove_buttons_if_disabled()
     except Exception as ex:
         print(f"[feedback error] {ex}")
+    if not first_run:
+        redeliver_undelivered()
 
     collected = []
     for fn in (fetch_feeds, fetch_pages, fetch_telegram_web, fetch_telegram_channels, fetch_x, fetch_gnews, fetch_gdelt):
@@ -1624,7 +1740,11 @@ def run_once():
     heartbeat(len(collected), broken)
     weekly_digest()
     meta_set("last_run_ts", str(run_started))
-    print(f"Done. New alerts sent: {sent}")
+    print(f"Done. New alerts: {sent}. Telegram messages delivered: {DELIVERY['ok']}, failed: {DELIVERY['failed']}")
+    if DELIVERY["failed"] and not DELIVERY["ok"]:
+        # Make the GitHub run fail: GitHub then emails you, so a broken Telegram link can't go unnoticed
+        raise RuntimeError(f"Telegram не принимает сообщения: {DELIVERY['last_error']}. "
+                           f"Проверьте TELEGRAM_CHAT_ID и что бот состоит в группе.")
 
 
 if __name__ == "__main__":
