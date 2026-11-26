@@ -321,16 +321,25 @@ def _call_llm(model, system, user, max_tokens):
             model=model, max_tokens=max_tokens, system=system,
             messages=[{"role": "user", "content": user}])
         return "".join(b.text for b in msg.content if b.type == "text")
+    base = os.environ["LLM_BASE_URL"].rstrip("/")
+    auth = {"Authorization": f"Bearer {os.environ['LLM_API_KEY']}"}
+    # Instructions go inside the user message: works with every model, including
+    # ones that reject a separate "system" message (e.g. Gemma).
     r = requests.post(
-        os.environ["LLM_BASE_URL"].rstrip("/") + "/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['LLM_API_KEY']}"},
+        base + "/chat/completions", headers=auth,
         json={"model": model, "max_tokens": max_tokens, "temperature": 0,
-              "messages": [{"role": "system", "content": system},
-                           {"role": "user", "content": user}]},
+              "messages": [{"role": "user", "content": f"{system}\n\n=====\n\n{user}"}]},
         timeout=120)
     if r.status_code == 429:
         raise RuntimeError("429 rate limit / quota")
-    r.raise_for_status()
+    if r.status_code in (400, 404) and "model" in r.text.lower():
+        try:
+            names = [m["id"] for m in requests.get(base + "/models", headers=auth, timeout=30).json()["data"]]
+            print(f"[AI] model '{model}' was rejected. Model names your key can use:\n  " + "\n  ".join(names))
+        except Exception:
+            pass
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
 
 
