@@ -7,7 +7,7 @@ concurrency: visit-alerts     # never run two copies at once
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,12 +15,13 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - name: Restore database
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: seen.db
           key: seen-db-${{ github.run_id }}
           restore-keys: seen-db-
-      - run: python monitor.py
+      - name: Run monitor
+        run: python monitor.py
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
@@ -35,3 +36,26 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          HEARTBEAT_HOUR_UTC: ${{ secrets.HEARTBEAT_HOUR_UTC }}
+          FEEDBACK_BUTTONS: ${{ secrets.FEEDBACK_BUTTONS }}
+          DIGEST_WEEKDAY: ${{ secrets.DIGEST_WEEKDAY }}
+          DIGEST_HOUR_MSK: ${{ secrets.DIGEST_HOUR_MSK }}
+      - name: Save database (also after a failed run, so nothing is re-sent)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen.db
+          key: seen-db-${{ github.run_id }}
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ERR=$(tail -c 400 monitor_error.txt 2>/dev/null || echo "ошибка до запуска скрипта (установка, сеть GitHub)")
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode text="🚨 Сбой мониторинга визитов: запуск завершился с ошибкой.
+          ${ERR}
+          Подробности: ${RUN_URL}" > /dev/null
