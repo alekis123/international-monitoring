@@ -12,7 +12,8 @@ Layers:
   4. Telegram       - public channels read from their web preview (t.me/s/...), no login;
                       optional Telethon fallback for channels without a web preview
   5. X (Twitter)    - optional; follows chosen accounts via the official paid X API
-  6. Web pages      - news list pages of official sites without RSS (Security Council, RDIF)
+  6. Websites       - official sites (ministries, Duma, Federation Council, Security Council, RDIF):
+                      the site's own RSS feed if it advertises one, otherwise news links on the page
 
 Pipeline: collect -> dedupe -> AI screen headlines (high recall) ->
           AI verify full text + check against recent alerts -> resolve dates -> Telegram.
@@ -74,13 +75,15 @@ MSK = dt.timezone(dt.timedelta(hours=3))  # weekday logic uses Moscow time
 # Tajikistan, Moldova, Ghana, Madagascar, Guinea, Guinea-Bissau, India.
 
 _RU = '(Russia OR Russian OR Kremlin OR Moscow)'
-_ACT = '(visit OR visiting OR talks OR delegation OR meeting OR "will meet" OR "intergovernmental commission")'
+_ACT = ('(visit OR visiting OR talks OR delegation OR meeting OR "will meet" OR "intergovernmental commission" '
+        'OR "joint commission" OR "intergovernmental committee" OR "co-chair")')
 
 # GDELT: English keywords match articles in all 65+ languages it translates.
 # Each query returns at most 250 articles, so the topic is split across several.
 GDELT_QUERIES = [
     f'{_RU} (visit OR visiting OR "will visit" OR "official visit" OR "state visit" OR "working visit")',
-    f'{_RU} (talks OR delegation OR "intergovernmental commission" OR "will meet" OR "bilateral meeting")',
+    f'{_RU} (talks OR delegation OR "intergovernmental commission" OR "joint commission" OR "intergovernmental committee" '
+    'OR "will meet" OR "bilateral meeting" OR "co-chair")',
     '(Putin OR Mishustin OR Lavrov OR Siluanov OR Manturov OR Novak OR Overchuk OR Belousov OR Reshetnikov '
     'OR Shoigu OR Matviyenko OR Volodin OR Nabiullina OR Ushakov) (visit OR talks OR meet OR trip)',
     # Priority countries, in groups
@@ -90,14 +93,19 @@ GDELT_QUERIES = [
     f'{_RU} {_ACT} (Turkey OR Turkiye OR Azerbaijan OR Bahrain OR Qatar OR Kuwait OR UAE OR Emirates OR Oman OR "Saudi Arabia" OR Egypt OR Morocco OR Algeria)',
     f'{_RU} {_ACT} (Armenia OR Hungary OR Slovakia OR Serbia OR Belarus OR Kazakhstan OR Uzbekistan OR Turkmenistan OR Kyrgyzstan OR Tajikistan OR Moldova)',
 ]
-GDELT_TIMESPAN = "1h"  # overlaps with the schedule so delayed runs don't leave gaps
+# Search windows: from the last successful run (plus a safety margin), at least 1 hour, at most 2 days.
+# Set at the start of each run, so a skipped or delayed GitHub run never leaves a gap.
+WINDOW_HOURS = 2
 
-_RU_ACT = '(визит OR визитом OR посетит OR переговоры OR делегация OR межправкомиссия OR встреча)'
+_RU_ACT = ('(визит OR визитом OR посетит OR переговоры OR делегация OR межправкомиссия OR "межправительственная комиссия" '
+           'OR "межправительственной комиссии" OR МПК OR сопредседатель OR встреча)')
 
 # Google News: (language, country, edition, query)
 GNEWS = [
     # Russian edition: general + targeted by country group
     ("ru", "RU", "RU:ru", '(визит OR посетит OR переговоры OR "прибудет" OR межправкомиссия OR делегация)'),
+    ("ru", "RU", "RU:ru", '("межправительственная комиссия" OR "межправительственной комиссии" OR "межправительственного комитета" '
+                          'OR "совместной комиссии" OR сопредседатель OR "двусторонние консультации")'),
     ("ru", "RU", "RU:ru", f'(Китай OR КНР OR Гонконг OR Тайвань OR Макао OR Вьетнам OR Камбоджа OR Таиланд OR Мьянма '
                           f'OR Япония OR Корея OR КНДР OR Индонезия OR Сингапур OR Лаос OR Малайзия OR Монголия OR Индия) {_RU_ACT}'),
     ("ru", "RU", "RU:ru", f'(Белоруссия OR Белоруссии OR Беларусь OR Казахстан OR Узбекистан OR Туркмения OR Туркменистан '
@@ -141,36 +149,79 @@ GNEWS = [
     ("id", "ID", "ID:id", "Rusia (kunjungan OR pertemuan)"),
 ]
 
-# Direct RSS feeds (add ministry or foreign-government feeds here)
+# Direct RSS feeds. FEEDS: every item goes to the AI. MEDIA_FEEDS: big general-news feeds,
+# only items that mention a visit/meeting/forum word or a Russian official go to the AI.
 FEEDS = {
     "ТАСС": "https://tass.ru/rss/v2.xml",
     "TASS (EN)": "https://tass.com/rss/v2.xml",
     "РИА Новости": "https://ria.ru/export/rss2/archive/index.xml",
-    "Интерфакс": "https://www.interfax.ru/rss.asp",
+    "Интерфакс": "https://www.interfax.ru/rss",
     "Кремль": "http://kremlin.ru/events/all/feed",
     "Правительство РФ": "http://government.ru/all/rss/",
+}
+MEDIA_FEEDS = {
+    "Коммерсантъ": "https://www.kommersant.ru/RSS/news.xml",
+    "Ведомости": "https://www.vedomosti.ru/rss/news",
+    "РБК": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+    "Известия": "https://iz.ru/xml/rss/all.xml",
+    "Российская газета": "https://rg.ru/xml/index.xml",
+    "Парламентская газета": "https://www.pnp.ru/rss/index.xml",
+    "ПРАЙМ": "https://1prime.ru/export/rss2/index.xml",
+    "RT на русском": "https://russian.rt.com/rss",
+    "RT (EN)": "https://www.rt.com/rss/news/",
+    "Лента.ру": "https://lenta.ru/rss/news",
+    "Газета.Ru": "https://www.gazeta.ru/export/rss/first.xml",
 }
 
 # Official websites without an RSS feed: the program reads the news list page and picks
 # links that match "link" (a regular expression). Each new link = one news item.
+# Without "link", the program first looks for an RSS feed advertised by the page and uses it;
+# otherwise it takes links to news articles from the page.
+# "filter": False -> every item goes to the AI; default (True) -> keyword prefilter first.
 PAGE_SOURCES = [
     {"name": "Совет Безопасности РФ (сайт)", "url": "http://www.scrf.gov.ru/news/allnews/",
-     "link": r"/news/allnews/\d+/?$"},
-    {"name": "РФПИ (сайт)", "url": "https://rdif.ru/", "link": r"fullNews/\d+"},
+     "link": r"/news/allnews/\d+/?$", "filter": False},
+    {"name": "РФПИ (сайт)", "url": "https://rdif.ru/", "link": r"fullNews/\d+", "filter": False},
+    # Full list of the day's news (the RSS feed only holds the last ~25 items)
+    {"name": "Интерфакс — все новости за день", "url": "https://www.interfax.ru/news/{Y}/{m}/{d}",
+     "link": r"interfax\.ru/(russia|world|business|moscow|culture|digital)/\d+$", "filter": False},
+    # Parliament
+    {"name": "Государственная Дума (сайт)", "url": "https://duma.gov.ru/news/"},
+    {"name": "Совет Федерации (сайт)", "url": "https://council.gov.ru/"},
+    # Ministries
+    {"name": "Минэкономразвития России (сайт)", "url": "https://economy.gov.ru/"},
+    {"name": "Минпромторг России (сайт)", "url": "https://minpromtorg.gov.ru/"},
+    {"name": "Минкультуры России (сайт)", "url": "https://culture.gov.ru/"},
+    {"name": "Минобрнауки России (сайт)", "url": "https://minobrnauki.gov.ru/"},
+    {"name": "Минприроды России (сайт)", "url": "https://www.mnr.gov.ru/"},
+    {"name": "Минпросвещения России (сайт)", "url": "https://edu.gov.ru/"},
+    {"name": "Минвостокразвития России (сайт)", "url": "https://minvr.gov.ru/"},
+    {"name": "Минсельхоз России (сайт)", "url": "https://mcx.gov.ru/"},
+    {"name": "Минстрой России (сайт)", "url": "https://minstroyrf.gov.ru/"},
+    {"name": "Минтранс России (сайт)", "url": "https://mintrans.gov.ru/press-center/news"},
+    {"name": "Минтруд России (сайт)", "url": "https://mintrud.gov.ru/"},
+    {"name": "Минфин России (сайт)", "url": "https://minfin.gov.ru/"},
+    {"name": "Минцифры России (сайт)", "url": "https://digital.gov.ru/"},
+    {"name": "Минэнерго России (сайт)", "url": "https://minenergo.gov.ru/"},
 ]
+# Generic rule for news-article links (used when a source has no "link" and no RSS feed)
+NEWS_LINK_RE = r"/(news|novost|press|presscenter|press-center|events|media|activity)\S*\d"
 
 # Public Telegram channels to read (usernames without @).
 # CORE channels: every post goes to the AI. Channels from telegram_channels.csv (ministries,
 # agencies, embassies, consulates, trade missions...): only posts containing visit/meeting
 # words go to the AI, which saves the free AI quota. Edit the CSV to add or remove channels.
-TG_CORE = ["MID_Russia", "tass_agency", "rian_ru"]
+TG_CORE = ["MID_Russia", "MariaVladimirovnaZakharova", "tass_agency", "rian_ru", "interfaxonline", "pool_n3"]
+TG_MAX_PAGES = 10   # busy channels: read up to 10 x ~20 older posts to reach the last post already seen
 TG_CHANNELS_FILE = os.environ.get("TG_CHANNELS_FILE") or "telegram_channels.csv"
 
 
 def load_tg_channels():
     """Returns (ordered list of usernames, {username_lower: display name})."""
     import csv
-    labels = {"mid_russia": "МИД России", "tass_agency": "ТАСС", "rian_ru": "РИА Новости"}
+    labels = {"mid_russia": "МИД России", "tass_agency": "ТАСС", "rian_ru": "РИА Новости",
+              "mariavladimirovnazakharova": "Мария Захарова, официальный представитель МИД",
+              "interfaxonline": "Интерфакс", "pool_n3": "Кремлёвский пул (Пул N3)"}
     order = list(TG_CORE)
     try:
         with open(TG_CHANNELS_FILE, encoding="utf-8-sig") as f:
@@ -277,7 +328,7 @@ def fetch_gdelt():
     items = []
     for q in GDELT_QUERIES:
         params = {"query": q, "mode": "artlist", "format": "json", "maxrecords": "250",
-                  "timespan": GDELT_TIMESPAN, "sort": "datedesc"}
+                  "timespan": f"{WINDOW_HOURS}h", "sort": "datedesc"}
         try:
             r = requests.get("https://api.gdeltproject.org/api/v2/doc/doc",
                              params=params, headers=UA, timeout=60)
@@ -302,7 +353,7 @@ def fetch_gnews():
     items = []
     for hl, gl, ceid, q in GNEWS:
         url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-            {"q": f"{q} when:2h", "hl": hl, "gl": gl, "ceid": ceid})
+            {"q": f"{q} when:{WINDOW_HOURS}h", "hl": hl, "gl": gl, "ceid": ceid})
         feed = feedparser.parse(url, request_headers=UA)
         for e in feed.entries:
             src = (e.get("source") or {}).get("title", "")
@@ -319,7 +370,8 @@ def fetch_gnews():
 
 def fetch_feeds():
     items = []
-    for name, url in FEEDS.items():
+    for name, url in list(FEEDS.items()) + list(MEDIA_FEEDS.items()):
+        flt = name in MEDIA_FEEDS
         feed = feedparser.parse(url, request_headers=UA)
         HEALTH[name] = len(feed.entries)
         if not feed.entries:
@@ -330,76 +382,147 @@ def fetch_feeds():
                 "text": re.sub("<[^>]+>", " ", e.get("summary", "")),
                 "url": e.get("link", ""), "uid": e.get("link", "") or e.get("title", ""),
                 "published": from_struct(e.get("published_parsed") or e.get("updated_parsed")),
+                "keyword_filter": flt, "channel": "feed:" + name,
             })
     return items
 
 
+def _domain(url):
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
 def fetch_pages():
-    """Read news list pages of official websites that have no RSS feed."""
+    """Read official websites: an advertised RSS feed if there is one, otherwise the news links
+    on the page itself."""
     from bs4 import BeautifulSoup
 
-    items = []
-    for src in PAGE_SOURCES:
-        found = 0
-        try:
-            r = requests.get(src["url"], headers=UA, timeout=30)
-            soup = BeautifulSoup(r.content, "html.parser")
-            pattern = re.compile(src["link"])
-            seen_urls = set()
-            for a in soup.find_all("a", href=True):
-                url = urllib.parse.urljoin(src["url"], a["href"])
-                title = a.get_text(" ", strip=True)
-                if not pattern.search(url) or len(title) < 20 or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                found += 1
-                items.append({"source": src["name"], "title": title[:300], "text": "", "url": url,
-                              "uid": url, "published": None, "channel": "page:" + src["name"],
-                              "keyword_filter": False})
-        except Exception as ex:
-            print(f"[page error] {src['name']}: {ex}")
-        HEALTH[src["name"]] = found
-        if not found:
-            print(f"[page] {src['name']}: no news links found (blocked or page layout changed?)")
+    def expand(src):
+        """URLs with {Y}/{m}/{d} = today's date (Moscow); shortly after midnight also yesterday."""
+        if "{Y}" not in src["url"]:
+            return [src]
+        now = dt.datetime.now(MSK)
+        days = [now.date()] + ([now.date() - dt.timedelta(days=1)] if now.hour < 3 else [])
+        return [dict(src, url=src["url"].format(Y=d.year, m=f"{d.month:02d}", d=f"{d.day:02d}")) for d in days]
+
+    from concurrent.futures import ThreadPoolExecutor
+    sources = [x for src in PAGE_SOURCES for x in expand(src)]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(_read_page, sources))
+    items, totals = [], {}
+    for src, got in zip(sources, results):
+        items += got
+        totals[src["name"]] = totals.get(src["name"], 0) + len(got)
+    for name, n in totals.items():
+        HEALTH[name] = n
+        print(f"[page] {name}: {n} items" if n else f"[page] {name}: nothing found (blocked or layout changed?)")
     return items
 
 
-def fetch_telegram_web():
-    """Read public channels from their web preview page - no account or login needed."""
+def _read_page(src):
     from bs4 import BeautifulSoup
-
-    items, failed = [], []
-    for ch in TG_CHANNELS:
+    items = []
+    if True:
+        found, how = 0, "page"
+        flt = src.get("filter", True)
+        base = {"source": src["name"], "channel": "page:" + src["name"], "keyword_filter": flt}
         try:
-            r = requests.get(f"https://t.me/s/{ch}", headers=UA, timeout=30)
+            r = requests.get(src["url"], headers=UA, timeout=30)
+            soup = BeautifulSoup(r.content, "html.parser")
+
+            # 1) RSS feed advertised by the page
+            if not src.get("link"):
+                for tag in soup.find_all("link", href=True):
+                    if re.search(r"rss|atom", str(tag.get("type", "")), re.I):
+                        feed = feedparser.parse(urllib.parse.urljoin(src["url"], tag["href"]), request_headers=UA)
+                        for e_ in feed.entries:
+                            items.append(dict(base, title=e_.get("title", ""),
+                                              text=re.sub("<[^>]+>", " ", e_.get("summary", "")),
+                                              url=e_.get("link", ""), uid=e_.get("link", "") or e_.get("title", ""),
+                                              published=from_struct(e_.get("published_parsed") or e_.get("updated_parsed"))))
+                            found += 1
+                        if found:
+                            how = "rss"
+                            break
+
+            # 2) News links on the page
+            if not found:
+                pattern = re.compile(src.get("link") or NEWS_LINK_RE, re.I)
+                same_site = _domain(src["url"])
+                seen_urls = set()
+                for a in soup.find_all("a", href=True):
+                    url = urllib.parse.urljoin(src["url"], a["href"])
+                    title = a.get_text(" ", strip=True)
+                    if (not pattern.search(url) or len(title) < 20 or url in seen_urls
+                            or not _domain(url).endswith(same_site)):
+                        continue
+                    seen_urls.add(url)
+                    found += 1
+                    items.append(dict(base, title=title[:300], text="", url=url, uid=url, published=None))
+        except Exception as ex:
+            print(f"[page error] {src['name']}: {ex}")
+    return items
+
+
+def _read_channel(ch, last_seen):
+    """Read one public channel's web preview. If the channel posted more than one page since
+    the last run, keep reading older pages until the last post already seen."""
+    from bs4 import BeautifulSoup
+    items, before, ok = [], None, False
+    for _ in range(TG_MAX_PAGES):
+        url = f"https://t.me/s/{ch}" + (f"?before={before}" if before else "")
+        try:
+            r = requests.get(url, headers=UA, timeout=30)
             if r.status_code == 429:          # Telegram asks us to slow down
                 time.sleep(15)
-                r = requests.get(f"https://t.me/s/{ch}", headers=UA, timeout=30)
-            soup = BeautifulSoup(r.text, "html.parser")
-            posts = soup.select("div.tgme_widget_message[data-post]")
-            HEALTH[f"Telegram @{ch}"] = len(posts)
-            if not posts:
-                failed.append(ch)  # preview disabled, renamed, or private
+                r = requests.get(url, headers=UA, timeout=30)
+        except Exception as ex:
+            print(f"[telegram web error] {ch}: {ex}")
+            break
+        posts = BeautifulSoup(r.text, "html.parser").select("div.tgme_widget_message[data-post]")
+        if not posts:
+            break
+        ok = True
+        ids = []
+        for post in posts:
+            path = post["data-post"]            # e.g. "MID_Russia/12345"
+            try:
+                msg_id = int(path.split("/")[-1])
+            except ValueError:
                 continue
-            for post in posts:
-                body = post.select_one("div.tgme_widget_message_text")
-                text = body.get_text(" ", strip=True) if body else ""
-                if not text:
-                    continue
-                path = post["data-post"]            # e.g. "MID_Russia/12345"
-                msg_id = path.split("/")[-1]
-                t = post.select_one("time[datetime]")
-                items.append({
-                    "source": tg_label(ch), "title": text[:300], "text": text,
-                    "url": f"https://t.me/{path}", "uid": f"tg:{ch}:{msg_id}",
-                    "published": from_iso(t["datetime"]) if t else None,
-                    "channel": ch.lower(), "keyword_filter": ch.lower() not in TG_CORE_LOWER,
-                })
-        except Exception as e:
-            print(f"[telegram web error] {ch}: {e}")
-            HEALTH[f"Telegram @{ch}"] = 0
+            ids.append(msg_id)
+            body = post.select_one("div.tgme_widget_message_text")
+            text = body.get_text(" ", strip=True) if body else ""
+            if not text or msg_id <= last_seen:
+                continue
+            t = post.select_one("time[datetime]")
+            items.append({
+                "source": tg_label(ch), "title": text[:300], "text": text,
+                "url": f"https://t.me/{path}", "uid": f"tg:{ch}:{msg_id}", "msg_id": msg_id,
+                "published": from_iso(t["datetime"]) if t else None,
+                "channel": ch.lower(), "keyword_filter": ch.lower() not in TG_CORE_LOWER,
+            })
+        if not ids or not last_seen or min(ids) <= last_seen + 1:
+            break
+        before = min(ids)
+        time.sleep(0.3)
+    return ch, items, ok
+
+
+def fetch_telegram_web():
+    """Read public channels from their web preview pages (no account needed), 6 at a time."""
+    from concurrent.futures import ThreadPoolExecutor
+    last = {ch: int(meta_get(f"tg_last:{ch.lower()}") or 0) for ch in TG_CHANNELS}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda ch: _read_channel(ch, last[ch]), TG_CHANNELS))
+    items, failed = [], []
+    for ch, got, ok in results:
+        HEALTH[f"Telegram @{ch}"] = 1 if ok else 0
+        if not ok:
             failed.append(ch)
-        time.sleep(0.5)
+        items += got
+        if got:
+            meta_set(f"tg_last:{ch.lower()}", str(max(i["msg_id"] for i in got)))
     if failed:
         print(f"[telegram web] no posts read from: {', '.join(failed)}")
     fetch_telegram_web.failed = failed
@@ -500,8 +623,9 @@ if LLM_PROVIDER == "anthropic":
     VERIFY_MODEL = os.environ.get("VERIFY_MODEL") or "claude-sonnet-5-5"
 else:
     VERIFY_MODEL = os.environ.get("VERIFY_MODEL") or SCREEN_MODEL
-SCREEN_BATCH = int(os.environ.get("SCREEN_BATCH") or "250")  # headlines per AI call
-VERIFY_BATCH = int(os.environ.get("VERIFY_BATCH") or "6")    # articles per AI call
+SCREEN_BATCH = int(os.environ.get("SCREEN_BATCH") or "150")  # items per AI call (headline + lead)
+VERIFY_BATCH = int(os.environ.get("VERIFY_BATCH") or "8")    # articles per AI call
+SAFETY_NET_MAX = int(os.environ.get("SAFETY_NET_MAX") or "40")  # extra items per run sent to verification
 AI_PAUSE = float(os.environ.get("AI_PAUSE_SECONDS") or "0")  # pause between calls (free tiers: 4-6)
 
 _ai_down = False  # set when the AI quota is exhausted, so the rest of the run uses keywords
@@ -566,7 +690,9 @@ RUSSIA_RE = re.compile(
     r"росси|рф\b|кремл|москв|путин|лавров|мишустин|russia|kremlin|moscow|putin|lavrov|俄|روسي|"
     r"rusia|russie|russland|rusya|rússia|रूस|ロシア|러시아|รัสเซีย|orosz|rusk|rusij|русиј", re.IGNORECASE)
 VISIT_RE = re.compile(
-    r"визит|посет|переговор|встреч|делегаци|межправкомисс|прибуд|посет|visit|talks|delegation|meet|summit|"
+    r"визит|посет|переговор|встреч|делегаци|межправ|межгосударствен|межпарламент|сопредседател|"
+    r"совместн\w*\s+(российск\w*\s+)?комисс|комисси\w*\s+по\s+(торгово|экономическ|сотрудничеств)|\bмпк\b|"
+    r"прибуд|visit|talks|delegation|meet|summit|intergovernmental|joint commission|co-chair|"
     r"访|訪|会谈|會談|会见|會見|زيارة|مباحثات|وفد|visita|reuni|visite|entretien|besuch|gespräch|ziyaret|görüş|heyet|"
     r"यात्रा|दौरा|वार्ता|会談|방문|회담|kunjungan|pertemuan|เยือน|หารือ|látogat|tárgyal|návštev|rokovan|poset|razgovor",
     re.IGNORECASE)
@@ -575,20 +701,69 @@ VISIT_RE = re.compile(
 # Prefilter for posts from official channels (ministries, embassies...): a post must contain
 # a visit/meeting word (Russian or the languages these channels post in) to reach the AI.
 TG_VISIT_RE = re.compile(
-    VISIT_RE.pattern + r"|встрет|прибыл|прибыв|поездк|командиров|консультаци|двусторон|межправ|саммит|"
-    r"форум|посол|переговор|рабоч\w* визит|соглашени|меморандум", re.IGNORECASE)
+    VISIT_RE.pattern + r"|встрет|прибыл|прибыв|поездк|командиров|консультаци|двусторон|саммит|"
+    r"форум|посол|рабоч\w* визит|соглашени|меморандум|российско-\w+|\w+-российск", re.IGNORECASE)
+
+
+# Russian officials (names and titles) and "takes part / travels / meets" words. Used for:
+#  - the SAFETY NET: an item with a Russian official + such a word goes to verification even if
+#    the headline screening dropped it (e.g. "Лавров примет участие в Дохийском форуме");
+#  - prefilters and the keyword fallback when the AI is unavailable.
+OFFICIAL_RE = re.compile(
+    r"путин|мишустин|лавров|силуанов|мантуров|новак|оверчук|белоусов|решетников|шойгу|матвиенко|володин|"
+    r"набиуллина|ушаков|песков|захаров|алиханов|цивилев|патрушев|голиков|хуснуллин|чернышенко|григоренко|"
+    r"савельев|трутнев|дмитриев|лихачев|лихачёв|рябков|руденко|галузин|грушко|вершинин|бородавкин|"
+    r"кожемяко|козак|орешкин|слуцк|косачев|косачёв|"
+    r"putin|mishustin|lavrov|siluanov|manturov|novak|overchuk|belousov|reshetnikov|shoigu|matviyenko|volodin|"
+    r"nabiullina|ushakov|peskov|zakharova|alikhanov|tsivilev|patrushev|golikova|khusnullin|chernyshenko|"
+    r"dmitriev|likhachev|ryabkov|rudenko|galuzin|"
+    r"министр|замминистра|заместител\w* министра|вице-премьер|зампред\w* правительства|глав\w* (мид|минфина|"
+    r"минэк|минпром|минэнерго|минсельхоз|минтранс|минобр|минкульт|минцифр|правительства|кабмина|"
+    r"госдумы|совфеда|совета федерации|росатом|ростех|роскосмос|рфпи|банка россии|цб)|"
+    r"секретар\w* (совета безопасности|совбеза)|спикер|председател\w* (госдумы|государственной думы|"
+    r"совета федерации|правительства)|посол\w* (россии|рф)|спецпредставител|российск\w* делегаци|"
+    r"делегаци\w* (россии|рф)|russian (foreign |deputy )?minister|russian delegation|kremlin",
+    re.IGNORECASE)
+EVENT_RE = re.compile(
+    r"визит|посет|прибуд|прибыл|прибыв|переговор|встрет|встреч|примет участие|принять участие|"
+    r"примут участие|выступ|форум|саммит|конференц|заседани|сесси|на полях|поездк|отправит|вылет|"
+    r"находиться с|межправ|консультаци|делегаци|"
+    r"visit|talks|summit|forum|will attend|to attend|will meet|trip|arrive|conference|session",
+    re.IGNORECASE)
+
+
+def _all_text(it, n=600):
+    return f"{it['title']} {(it.get('text') or '')[:n]}"
+
+
+def safety_net(it):
+    s = _all_text(it)
+    return bool(OFFICIAL_RE.search(s) and EVENT_RE.search(s))
 
 
 def keyword_match(it):
-    s = f"{it['title']} {it.get('text', '')[:500]}"
-    return bool(RUSSIA_RE.search(s) and VISIT_RE.search(s))
+    """Keyword fallback used when the AI is unavailable."""
+    s = _all_text(it)
+    return bool((RUSSIA_RE.search(s) or OFFICIAL_RE.search(s)) and (VISIT_RE.search(s) or EVENT_RE.search(s)))
 
 
-SCREEN_PROMPT = """You are a HIGH-RECALL filter for an analyst. You get numbered headlines in any language.
-Return the numbers of every headline that MIGHT concern a visit, trip, talks, meeting, negotiations,
-delegation, summit, intergovernmental commission or dialogue between officials of Russia and officials
-of any other country - in either direction (Russians going abroad, or foreigners coming to Russia or
-meeting Russians anywhere). Include announcements, plans, and events under way.
+def prefilter_ok(it):
+    """For sources marked keyword_filter (official channels, big media feeds, ministry sites)."""
+    s = it.get("text") or it["title"]
+    return bool(TG_VISIT_RE.search(s) or EVENT_RE.search(s) and OFFICIAL_RE.search(s))
+
+
+SCREEN_PROMPT = """You are a HIGH-RECALL filter for an analyst. You get numbered news items in any
+language, each as "headline — lead of the text". Return the numbers of every item that MIGHT concern:
+- a Russian official travelling abroad for ANY reason: visit, talks, consultations, a forum, summit,
+  conference, session, ministerial meeting, international organization event (UN, BRICS, SCO, CIS,
+  EAEU, CSTO, G20, APEC...), "примет участие", "выступит", "посетит", "будет находиться с визитом";
+- a foreign official coming to Russia (including to forums or conferences in Russia) or meeting
+  Russian officials anywhere, including "on the sidelines" (на полях) of multilateral events;
+- delegations, intergovernmental commissions (межправкомиссия / межправительственная комиссия,
+  co-chairs, working groups), bilateral consultations or dialogues involving Russia.
+Include announcements, plans, and events under way. The headline may not name the country or use
+the word "visit" (e.g. "Лавров примет участие в Дохийском форуме" = a trip to Qatar) - read the lead.
 When in doubt, INCLUDE it. Missing a real event is far worse than a false positive.
 Reply with ONLY JSON: {"keep": [numbers]}"""
 
@@ -597,7 +772,10 @@ between Russian government officials and officials of other countries. You get s
 each with its publication date.
 
 An item is RELEVANT if it announces or reports a visit/trip/meeting/talks/commission/dialogue that is
-UPCOMING or UNDER WAY (not fully concluded), involving:
+UPCOMING or UNDER WAY (not fully concluded), involving the officials below. This INCLUDES a Russian
+official's participation in a forum, summit, conference, session or international-organization event
+abroad (e.g. Lavrov at the Doha Forum in Qatar = relevant, country Катар), and foreign officials
+attending events in Russia. Meetings "on the sidelines" count too. Involving:
 - a Russian state official (president, PM, deputy PMs, ministers, deputy ministers, heads of federal
   agencies, Kremlin staff, presidential envoys, ambassadors-at-large, Federal Assembly leadership,
   central bank leadership, heads of major state corporations acting officially), AND
@@ -620,6 +798,9 @@ If several items in this batch describe the same event, return it ONCE (most inf
 
 If ANALYST FEEDBACK is provided, follow it: avoid alerts similar to ones marked NOT useful.
 
+Items marked "ANALYST CHECK" were sent by the analyst for a manual check: ALWAYS return them, with
+"relevant": true or false and "reason_ru" (one sentence in Russian explaining the decision).
+
 LANGUAGE: write summary, new_info, officials, countries, location, title_ru and short_ru IN RUSSIAN
 (standard Russian spelling of names and countries, e.g. "Антон Силуанов, министр финансов РФ").
 title_ru = the item's headline translated into natural Russian (if already Russian, copy it as is).
@@ -638,9 +819,11 @@ the text says, using these DATEREF objects; the program computes the actual date
 tense: "future" if the text describes the event as upcoming, "present" if happening now/today,
 "past" if it already took place (fully or partly).
 
-Return ONLY relevant items, as ONLY JSON:
+Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
 {"results": [
  {"n": item number,
+  "relevant": true | false,
+  "reason_ru": "",
   "confidence": "high" | "medium",
   "duplicate_of": alert id number or null,
   "change_type": "none" | "date_confirmed" | "date_changed" | "postponed" | "cancelled" | "other_update",
@@ -663,12 +846,20 @@ elsewhere = meeting in a third country or online.
 If none are relevant: {"results": []}"""
 
 
+def _lead(it, n=220):
+    text = re.sub(r"\s+", " ", it.get("text") or "").strip()
+    if not text or text.startswith(it["title"][:60]):
+        text = text[len(it["title"]):] if text.startswith(it["title"]) else ""
+    return text[:n]
+
+
 def screen(items):
-    """Stage 1: batch headlines through the AI (keyword fallback if AI unavailable)."""
+    """Stage 1: batch headline + lead through the AI (keyword fallback if AI unavailable)."""
     keep = []
     for i in range(0, len(items), SCREEN_BATCH):
         batch = items[i:i + SCREEN_BATCH]
-        lines = "\n".join(f"{n}. {it['title'][:200]}" for n, it in enumerate(batch))
+        lines = "\n".join(f"{n}. {it['title'][:200]}" + (f" — {_lead(it)}" if _lead(it) else "")
+                          for n, it in enumerate(batch))
         res = ask_json(SCREEN_MODEL, SCREEN_PROMPT, lines, max_tokens=1000)
         if res is None:
             keep.extend(it for it in batch if keyword_match(it))
@@ -835,8 +1026,12 @@ def resolve_when(res, item):
         out.update(precision="day", start=val.isoformat(), end=val.isoformat(), label=fmt_day(val))
         if end and end[0] == "day" and end[1] > val:
             b = end[1]
-            out.update(end=b.isoformat(),
-                       label=f"с {fmt_day(val, with_year=(val.year != b.year))} по {fmt_day(b)}")
+            if (val.year, val.month) == (b.year, b.month):
+                span = f"{val.day}–{b.day} {MON_GEN[b.month - 1]} {b.year}"
+            else:
+                span = (f"{val.day} {MON_GEN[val.month - 1]}" + (f" {val.year}" if val.year != b.year else "")
+                        + f" – {b.day} {MON_GEN[b.month - 1]} {b.year}")
+            out.update(end=b.isoformat(), label=f"{span} ({WD_SHORT[val.weekday()]}–{WD_SHORT[b.weekday()]})")
     elif kind == "week":
         sun = val + dt.timedelta(days=6)
         out.update(precision="week", start=val.isoformat(), end=sun.isoformat(), label=fmt_resolved(start))
@@ -1036,8 +1231,17 @@ def process_feedback():
     """Read 👍/👎 clicks since the last run and store them."""
     offset = int(meta_get("tg_offset") or 0)
     updates = tg("getUpdates", {"offset": offset, "timeout": 0}) or []
+    checks = json.loads(meta_get("manual_checks") or "[]")
+    my_chat = str(os.environ["TELEGRAM_CHAT_ID"])
     for u in updates:
         offset = max(offset, u["update_id"] + 1)
+        msg = u.get("message") or u.get("channel_post")
+        if msg and str(msg.get("chat", {}).get("id")) == my_chat:
+            text = msg.get("text") or msg.get("caption") or ""
+            if re.match(r"^/(check|проверь)\b", text.strip(), re.I) or msg["chat"].get("type") == "private":
+                for url in re.findall(r"https?://\S+", text)[:5]:
+                    checks.append({"url": url.rstrip(").,»\"'"), "reply_to": msg.get("message_id")})
+            continue
         cq = u.get("callback_query")
         if not cq:
             continue
@@ -1054,7 +1258,30 @@ def process_feedback():
             tg("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
                                           "reply_markup": fb_markup(aid, vote)})
     db.commit()
+    meta_set("manual_checks", json.dumps(checks[-20:], ensure_ascii=False))
     meta_set("tg_offset", str(offset))
+
+
+def manual_items():
+    """Links sent to the bot with /check: turned into items that always go to verification."""
+    checks = json.loads(meta_get("manual_checks") or "[]")
+    items = []
+    for c in checks:
+        title, text = c["url"], ""
+        try:
+            page = requests.get(c["url"], headers=UA, timeout=25).text
+            m = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+            if m:
+                title = html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:300]
+            if trafilatura:
+                text = (trafilatura.extract(page) or "")[:2500]
+        except Exception as ex:
+            print(f"[check] could not open {c['url']}: {ex}")
+        items.append({"source": "проверка по запросу", "title": title, "text": text or title,
+                      "url": c["url"], "uid": c["url"], "published": None,
+                      "manual": True, "reply_to": c.get("reply_to")})
+    meta_set("manual_checks", "[]")
+    return items
 
 
 def remove_buttons_if_disabled():
@@ -1250,7 +1477,14 @@ def weekly_digest():
 # MAIN
 # =============================================================================
 def run_once():
+    global WINDOW_HOURS
     first_run = meta_get("initialized") is None
+    run_started = time.time()
+    last_ok = float(meta_get("last_run_ts") or 0)
+    gap_h = (run_started - last_ok) / 3600 if last_ok else 1
+    WINDOW_HOURS = int(min(48, max(1, gap_h + 0.5) + 0.999))
+    print(f"Search window for Google News / GDELT: {WINDOW_HOURS} h "
+          f"(last successful run {gap_h:.1f} h ago)" if last_ok else f"Search window: {WINDOW_HOURS} h")
 
     try:
         process_feedback()
@@ -1285,29 +1519,48 @@ def run_once():
             db.execute("INSERT OR IGNORE INTO seen (h, ts) VALUES (?, ?)", (k, now))
         if not it["title"].strip() or it.get("channel") in fresh_channels:
             continue
-        if it.get("keyword_filter") and not TG_VISIT_RE.search(it.get("text") or it["title"]):
+        if it.get("keyword_filter") and not prefilter_ok(it):
             prefiltered += 1
             continue
         new_items.append(it)
     db.commit()
     meta_set("tg_known_channels", json.dumps(sorted(known | fresh_channels)))
-    print(f"New items: {len(new_items)} (official-channel posts skipped by keyword prefilter: {prefiltered})")
+    print(f"New items: {len(new_items)} (skipped by keyword prefilter: {prefiltered})")
 
     if first_run:
         print("First run: recorded existing items, no alerts sent.")
         send("✅ <b>Мониторинг визитов запущен.</b> Оповещения начнутся со следующего запуска.")
         meta_set("initialized", "1")
         meta_set("heartbeat", dt.datetime.now(UTC).date().isoformat())
+        meta_set("last_run_ts", str(run_started))
         return
 
     shortlist = screen(new_items)
-    print(f"Shortlisted: {len(shortlist)}")
+    print(f"Shortlisted by AI screening: {len(shortlist)}")
+
+    # SAFETY NET: Russian official + travel/meeting/forum word -> verify even if screening dropped it
+    chosen = {id(it) for it in shortlist}
+    net = [it for it in new_items if id(it) not in chosen and safety_net(it)]
+    net.sort(key=lambda it: bool(it.get("keyword_filter")))      # main agencies first
+    if len(net) > SAFETY_NET_MAX:
+        print(f"[safety net] {len(net)} candidates, verifying the first {SAFETY_NET_MAX}")
+    for it in net[:SAFETY_NET_MAX]:
+        print(f"[safety net] added: {it['title'][:120]} ({it['source']})")
+    shortlist += net[:SAFETY_NET_MAX]
+
+    # Links sent with /check in the chat
+    manual = manual_items()
+    if manual:
+        print(f"[check] manual checks requested: {len(manual)}")
+    shortlist = manual + shortlist
+    for it in shortlist:
+        print(f"[verify] {'CHECK ' if it.get('manual') else ''}{it['title'][:120]} ({it['source']})")
 
     sent = 0
     for i in range(0, len(shortlist), VERIFY_BATCH):
         batch = shortlist[i:i + VERIFY_BATCH]
         user = (feedback_block() + f"RECENT ALERTS:\n{recent_alerts_block()}\n\n" + "\n\n".join(
-            f"ITEM {n}\nSource: {it['source']}\nPublished: "
+            f"ITEM {n}{' (ANALYST CHECK)' if it.get('manual') else ''}\nSource: {it['source']}\nPublished: "
             f"{pub_date_msk(it).isoformat()} ({WD_RU[pub_date_msk(it).weekday()]})\n"
             f"URL: {it['url']}\nTitle: {it['title']}\nText: {article_text(it)}"
             for n, it in enumerate(batch)))
@@ -1316,6 +1569,10 @@ def run_once():
         if res is None:
             # AI unavailable: still alert, clearly marked, so nothing is silently lost
             for it in batch:
+                if it.get("manual"):
+                    send("❔ Проверить ссылку не удалось: ИИ сейчас недоступен. Пришлите её ещё раз позже.",
+                         reply_to=it.get("reply_to"))
+                    continue
                 if not keyword_match(it):
                     continue
                 db.execute("INSERT INTO alerts (ts, summary, event_date, url, status, title_ru, source, "
@@ -1329,25 +1586,44 @@ def run_once():
                 sent += 1
             continue
 
+        answered = set()
         for r in res.get("results", []):
             n = r.get("n")
             if not isinstance(n, int) or not 0 <= n < len(batch):
                 continue
             it = batch[n]
+            answered.add(n)
+            if r.get("relevant") is False:
+                print(f"[verify] not relevant: {it['title'][:100]} — {r.get('reason_ru', '')}")
+                if it.get("manual"):
+                    send(f"🔎 <b>Проверка ссылки:</b> не относится к теме мониторинга.\n{e(r.get('reason_ru'))}",
+                         reply_to=it.get("reply_to"))
+                continue
             w = resolve_when(r, it)
             dup = r.get("duplicate_of")
             row = db.execute("SELECT * FROM alerts WHERE id=?", (dup,)).fetchone() if isinstance(dup, int) else None
+            print(f"[verify] RELEVANT{' (already alerted #' + str(dup) + ')' if row else ''}: {it['title'][:100]}")
             if row:
                 handle_update(row, r, it, w)
+                if it.get("manual"):
+                    send("🔎 <b>Проверка ссылки:</b> это событие уже есть в оповещениях (см. ответ на исходное сообщение).",
+                         reply_to=it.get("reply_to"))
                 continue
             create_alert(r, it, w)
             sent += 1
+        for n, it in enumerate(batch):
+            if it.get("manual") and n not in answered:
+                send("🔎 <b>Проверка ссылки:</b> ИИ не нашёл здесь анонса визита или встречи с участием "
+                     "российских официальных лиц.", reply_to=it.get("reply_to"))
+            elif n not in answered:
+                print(f"[verify] not relevant: {it['title'][:100]}")
 
     # Housekeeping
     db.execute("DELETE FROM seen WHERE ts < ?", (time.time() - 14 * 86400,))
     db.commit()
     heartbeat(len(collected), broken)
     weekly_digest()
+    meta_set("last_run_ts", str(run_started))
     print(f"Done. New alerts sent: {sent}")
 
 
