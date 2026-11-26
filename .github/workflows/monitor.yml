@@ -9,13 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - name: Restore database
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: seen.db
           key: seen-db-${{ github.run_id }}
@@ -23,26 +23,29 @@ jobs:
       - name: Run monitor
         run: python monitor.py
         env:
+          # Passwords and keys: Settings -> Secrets and variables -> Actions -> Secrets
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
-          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          SCREEN_MODEL: ${{ secrets.SCREEN_MODEL }}
-          VERIFY_MODEL: ${{ secrets.VERIFY_MODEL }}
-          AI_PAUSE_SECONDS: ${{ secrets.AI_PAUSE_SECONDS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
-          HEARTBEAT_HOUR_UTC: ${{ secrets.HEARTBEAT_HOUR_UTC }}
-          FEEDBACK_BUTTONS: ${{ secrets.FEEDBACK_BUTTONS }}
-          DIGEST_WEEKDAY: ${{ secrets.DIGEST_WEEKDAY }}
-          DIGEST_HOUR_MSK: ${{ secrets.DIGEST_HOUR_MSK }}
+          # Ordinary settings: Settings -> Secrets and variables -> Actions -> Variables
+          # (variables are not hidden in the logs; an old secret with the same name still works)
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || secrets.LLM_PROVIDER }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL || secrets.LLM_BASE_URL }}
+          SCREEN_MODEL: ${{ vars.SCREEN_MODEL || secrets.SCREEN_MODEL }}
+          VERIFY_MODEL: ${{ vars.VERIFY_MODEL || secrets.VERIFY_MODEL }}
+          AI_PAUSE_SECONDS: ${{ vars.AI_PAUSE_SECONDS || secrets.AI_PAUSE_SECONDS }}
+          HEARTBEAT_HOUR_UTC: ${{ vars.HEARTBEAT_HOUR_UTC || secrets.HEARTBEAT_HOUR_UTC }}
+          FEEDBACK_BUTTONS: ${{ vars.FEEDBACK_BUTTONS || secrets.FEEDBACK_BUTTONS }}
+          DIGEST_WEEKDAY: ${{ vars.DIGEST_WEEKDAY || secrets.DIGEST_WEEKDAY }}
+          DIGEST_HOUR_MSK: ${{ vars.DIGEST_HOUR_MSK || secrets.DIGEST_HOUR_MSK }}
       - name: Save database (also after a failed run, so nothing is re-sent)
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: seen.db
           key: seen-db-${{ github.run_id }}
