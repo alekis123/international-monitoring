@@ -1479,16 +1479,20 @@ def handle_update(row, r, it, w):
     ct = r.get("change_type") or "none"
     old_prec = old_precision(row)
     old_label = row["date_label"] or row["event_date"] or "не указано"
-    new_day = w["precision"] == "day"
+    # A new date is only trusted if the article states it in words (date_text). Follow-up reports often
+    # carry their own publication day or "yesterday/today", which must not overwrite the event date.
+    stated = bool(w.get("text"))
+    explicit = (r.get("date_start") or {}).get("kind") == "absolute"
+    new_day = w["precision"] == "day" and stated
     date_differs = (w["start"], w["end"]) != (row["date_start"], row["date_end"])
 
     if ct == "cancelled":
         kind = "cancelled"
     elif ct == "postponed":
         kind = "postponed"
-    elif new_day and old_prec != "day":
+    elif ct == "date_confirmed" and new_day and old_prec != "day":
         kind = "confirmed"
-    elif new_day and old_prec == "day" and ct == "date_changed" and date_differs:
+    elif ct == "date_changed" and new_day and explicit and old_prec == "day" and date_differs:
         kind = "changed"
     elif ct == "participants_added" and r.get("new_info"):
         kind = "participants"
@@ -1528,7 +1532,8 @@ def handle_update(row, r, it, w):
 
     # Update the stored event
     status = {"cancelled": "cancelled", "postponed": "active" if new_day else "postponed"}.get(kind, "active")
-    if new_day or (kind == "confirmed"):
+    # The stored event date changes ONLY when the message is about the date itself
+    if kind in ("confirmed", "changed") or (kind == "postponed" and new_day):
         db.execute("UPDATE alerts SET date_start=?, date_end=?, date_precision=?, date_label=?, date_text=?, "
                    "event_date=? WHERE id=?",
                    (w["start"], w["end"], w["precision"], w["label"], w["text"], w["start"], row["id"]))
