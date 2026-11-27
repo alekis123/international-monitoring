@@ -835,6 +835,9 @@ SAME event as one of them, set duplicate_of to that alert id and set change_type
 Do not invent contradictions: "the invitation stands" and "I don't know if he accepted" are compatible.
 Items about postponement or cancellation of an event NOT in recent alerts are relevant too.
 If several items in this batch describe the same event, return it ONCE (most informative item).
+SAME EVENT: the same Russian official with the same country within a few days is ONE event, however
+it is described (arrival, talks, a round table, a visit to a site, the official's departure). Reports
+published the next day about such a visit are duplicates, not new events.
 
 If ANALYST FEEDBACK is provided, follow it.
 
@@ -1389,8 +1392,6 @@ def alert_message_from_row(row):
         lines += participant_lines(row["participants_ru"], row["participants_foreign"], row["countries"])
     elif row["officials"]:
         lines.append(f"👤 <b>Кто:</b> {e(row['officials'])}")
-    if row["direction"]:
-        lines.append(f"🧭 <b>Направление:</b> {e(DIRECTION_RU.get(row['direction'], row['direction']))}")
     if row["location"]:
         lines.append(f"📍 <b>Где:</b> {e(row['location'])}")
     when = row["date_label"] or row["event_date"] or "не указано"
@@ -1462,7 +1463,6 @@ def alert_message(r, it, w):
     lines += [f"{status}: {countries_line(r.get('countries'))}", "", e(r.get("summary")), ""]
     lines += participant_lines(r.get("participants_ru"), r.get("participants_foreign"), r.get("countries"))
     lines += [
-        f"🧭 <b>Направление:</b> {e(DIRECTION_RU.get(r.get('direction'), r.get('direction')))}",
         f"📍 <b>Где:</b> {e(r.get('location') or 'не указано')}",
         f"📅 <b>Когда:</b> {e(when)}",
     ]
@@ -1745,86 +1745,48 @@ def digest_line(row):
 
 
 def build_digest(today):
-    start = today + dt.timedelta(days=1)                            # from tomorrow (Saturday)
-    end = today + dt.timedelta(days=(7 - today.weekday()) + 6)      # to Sunday of next week
+    """One message with every event still expected (today's ongoing events included, past ones left out)."""
+    t = today.isoformat()
     rows = db.execute(
         "SELECT * FROM alerts WHERE status IN ('active','postponed') AND date_start IS NOT NULL "
-        "AND date_start <= ? AND COALESCE(date_end, date_start) >= ? ORDER BY date_start",
-        (end.isoformat(), start.isoformat())).fetchall()
+        "AND COALESCE(date_end, date_start) >= ? ORDER BY date_start, id", (t,)).fetchall()
     dated = [r for r in rows if r["date_precision"] == "day" and r["status"] == "active"]
     vague = [r for r in rows if r["date_precision"] in ("week", "month") or r["status"] == "postponed"]
-    recent = time.time() - 14 * 86400
-    vague += db.execute("SELECT * FROM alerts WHERE status IN ('active','postponed') AND "
-                        "COALESCE(date_precision,'none')='none' AND ts > ? ORDER BY ts DESC LIMIT 8",
-                        (recent,)).fetchall()
+    # announced without any date in the last 3 weeks and not reported as over
+    vague += db.execute(
+        "SELECT * FROM alerts WHERE status IN ('active','postponed') AND COALESCE(date_precision,'none')='none' "
+        "AND date_start IS NULL AND ts > ? ORDER BY ts DESC", (time.time() - 21 * 86400,)).fetchall()
 
-    title = (f"📋 <b>Визиты на предстоящую неделю</b> "
-             f"({start.day} {MON_GEN[start.month - 1]} – {end.day} {MON_GEN[end.month - 1]})")
-    lines = [title, ""]
+    lines = [f"📋 <b>Ожидаемые визиты и встречи</b> (на {today.day} {MON_GEN[today.month - 1]} {today.year})"]
     if not dated and not vague:
-        lines.append("Анонсированных визитов на этот период нет.")
-        return "\n".join(lines)
+        lines += ["", "Ожидаемых мероприятий нет."]
+        return ["\n".join(lines)]
 
     current = None
     for r in dated:
-        day = max(r["date_start"], start.isoformat())
+        day = max(r["date_start"], t)
         if day != current:
-            if current:
-                lines.append("")
-            lines.append(f"<b>{short_day(day)}</b>")
+            lines += ["", f"<b>{short_day(day)}</b>" + (" (сегодня)" if day == t else "")]
             current = day
         extra = f" (до {short_day(r['date_end'])})" if r["date_end"] and r["date_end"] > r["date_start"] else ""
         lines.append(digest_line(r) + extra)
 
     if vague:
         lines += ["", "<b>Дата уточняется</b>"]
-        for r in vague[:10]:
+        for r in vague:
             note = "отложен" if r["status"] == "postponed" else (r["date_label"] or "дата не объявлена")
             lines.append(f"{digest_line(r)} ({e(note)})")
 
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3900].rsplit("\n", 1)[0] + "\n…список сокращён, полный перечень — в архиве ниже."
-    return text
-
-
-def send_archive():
-    import csv
-    path = "visit_archive.csv"
-    cols = [("id", "№"), ("ts", "Отправлено"), ("status", "Статус"), ("countries", "Страны"),
-            ("officials", "Участники"), ("direction", "Направление"), ("location", "Место"),
-            ("date_start", "Дата начала"), ("date_end", "Дата окончания"), ("date_label", "Дата (текстом)"),
-            ("date_text", "Формулировка в источнике"), ("summary", "Описание"), ("title_ru", "Заголовок"),
-            ("source", "Источник"), ("url", "Ссылка"), ("vote", "Оценка"), ("updates", "История изменений")]
-    status_ru = {"active": "активен", "postponed": "отложен", "cancelled": "отменён", "unverified": "не проверен"}
-    rows = db.execute("SELECT * FROM alerts ORDER BY id").fetchall()
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:   # BOM + ';' = opens correctly in Excel
-        w = csv.writer(f, delimiter=";")
-        w.writerow([c[1] for c in cols])
-        for r in rows:
-            vals = []
-            for c, _ in cols:
-                v = r[c]
-                if c == "ts" and v:
-                    v = dt.datetime.fromtimestamp(v, MSK).strftime("%d.%m.%Y %H:%M")
-                elif c in ("date_start", "date_end") and v:
-                    try:
-                        v = dt.date.fromisoformat(v).strftime("%d.%m.%Y")
-                    except ValueError:
-                        pass
-                elif c == "status":
-                    v = status_ru.get(v or "active", v)
-                elif c == "direction":
-                    v = DIRECTION_RU.get(v, v)
-                elif c == "vote":
-                    v = {"up": "👍", "down": "👎"}.get(v, "")
-                vals.append(v if v is not None else "")
-            w.writerow(vals)
-    name = f"архив_визитов_{dt.datetime.now(MSK).date().isoformat()}.csv"
-    with open(path, "rb") as f:
-        tg("sendDocument", {"chat_id": chat_id(),
-                            "caption": f"🗂 Архив всех оповещений ({len(rows)}). Открывается в Excel."},
-           files={"document": (name, f, "text/csv")})
+    # Telegram limit is 4096 characters per message: normally everything fits in one message;
+    # if not, the list continues in the next message instead of being cut.
+    parts, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > 4000:
+            parts.append(cur)
+            cur = "📋 <i>(продолжение)</i>"
+        cur = f"{cur}\n{line}" if cur else line
+    parts.append(cur)
+    return parts
 
 
 def weekly_digest():
@@ -1834,8 +1796,8 @@ def weekly_digest():
     today = now.date()
     if now.weekday() != weekday or now.hour < hour or meta_get("digest_sent") == today.isoformat():
         return
-    send(build_digest(today))
-    send_archive()
+    for part in build_digest(today):
+        send(part)
     meta_set("digest_sent", today.isoformat())
 
 
@@ -1876,6 +1838,49 @@ def clean_vague_date(r):
     """'в эти же дни', 'на днях', 'soon' are not dates: treat the date as unknown."""
     if VAGUE_DATE_RE.search(r.get("date_text") or "") and not EXPLICIT_DATE_RE.search(r.get("date_text") or ""):
         r["date_text"], r["date_start"], r["date_end"] = "", {"kind": "unknown"}, None
+
+
+NAME_STOP = {"россии", "россия", "российской", "федерации", "министр", "министра", "глава", "главы", "заместитель",
+             "председатель", "президент", "премьер", "делегация", "посол", "секретарь", "совета", "безопасности",
+             "государственной", "думы", "правительства", "министерства", "директор", "генеральный", "советник",
+             "специальный", "представитель", "первый", "мид", "мчс", "рф"}
+
+
+def name_keys(text):
+    """Surname-like words ('Куренков', 'Куренкова' -> 'курен') to compare participants across articles."""
+    keys = set()
+    for w in re.findall(r"[А-ЯЁA-Z][а-яёa-z\-]{3,}", text or ""):
+        low = w.lower()
+        if low not in NAME_STOP:
+            keys.add(low[:5])
+    return keys
+
+
+def find_same_event(r, w):
+    """Code-level duplicate check, in case the AI did not link the item to an earlier alert:
+    same counterpart country + same Russian participant + dates within 3 days = the same event
+    (e.g. 'Куренков прибыл в Бахрейн' and yesterday's 'Куренков провёл переговоры с главой МВД Бахрейна')."""
+    countries = {c.lower()[:5] for c in country_list(r.get("countries"))}
+    people = name_keys(r.get("participants_ru"))
+    if not countries or not people:
+        return None
+    rows = db.execute("SELECT * FROM alerts WHERE ts > ? AND COALESCE(status,'active') != 'unverified' "
+                      "ORDER BY id DESC", (time.time() - 14 * 86400,)).fetchall()
+    for row in rows:
+        if not countries & {c.lower()[:5] for c in country_list(row["countries"])}:
+            continue
+        if not people & name_keys(f"{row['participants_ru'] or ''} {row['officials'] or ''} {row['summary'] or ''}"):
+            continue
+        if w["start"] and row["date_start"]:
+            a0, a1 = dt.date.fromisoformat(w["start"]), dt.date.fromisoformat(w["end"] or w["start"])
+            b0 = dt.date.fromisoformat(row["date_start"])
+            b1 = dt.date.fromisoformat(row["date_end"] or row["date_start"])
+            if (a0 - b1).days > 3 or (b0 - a1).days > 3:
+                continue                      # e.g. the same minister's next trip a month later
+        elif time.time() - (row["ts"] or 0) > 7 * 86400:
+            continue
+        return row
+    return None
 
 
 def reject_reason(r, it, w):
@@ -2067,6 +2072,12 @@ def run_once():
             w = resolve_when(r, it)
             dup = r.get("duplicate_of")
             row = db.execute("SELECT * FROM alerts WHERE id=?", (dup,)).fetchone() if isinstance(dup, int) else None
+            if not row and not it.get("manual"):
+                row = find_same_event(r, w)
+                if row:
+                    print(f"[verify] same event as alert #{row['id']} (code check): {it['title'][:100]}")
+                    if (r.get("change_type") or "none") == "none" and r.get("tense") in ("past", "present"):
+                        continue      # a later report about the same visit: nothing new to send
             if not row and not it.get("manual"):
                 why = reject_reason(r, it, w)
                 if why:
