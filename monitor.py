@@ -809,7 +809,8 @@ statements, interviews, opinions and policy announcements that do not announce a
 company consultations without a stated visit/meeting of officials (e.g. "Малайзия обсуждает с
 Росатомом меморандум"); culture, singers, artists, art groups, schoolchildren, students, youth groups,
 sports, NGOs and charities (e.g. Red Cross); regional/governor-level contacts; battlefield news;
-speculation.
+speculation; the CSTO (ОДКБ) and military-technical cooperation (arms trade, defence industry, military
+equipment, Rosoboronexport, ФСВТС), plus any topic in the analyst's IGNORED TOPICS list.
 
 PARTICIPANTS: list only people who TAKE PART in the event, with names and positions if the text
 gives them. Someone who merely announced or commented on the event (e.g. a spokesman, or an envoy
@@ -863,6 +864,9 @@ article_date: if the text shows when the ARTICLE was written (a dateline, "publi
 in the text that dates it, e.g. a 2019 article), give it as YYYY-MM-DD; otherwise leave it empty.
 The "Published" date you are given can be wrong for re-published old articles - trust the text.
 Weekday words ("Friday", "в пятницу") refer to the article's own week, which may be years ago.
+If the text gives an explicit calendar date ("в минувший четверг, 26 ноября"), use THAT date as an
+"absolute" DATEREF. "минувший/прошедший/прошлый" = last. Vague phrases ("в эти же дни", "на днях",
+"недавно", "soon") are NOT dates: use {"kind":"unknown"}.
 location: the place of the EVENT as stated in the text (e.g. "Москва, Россия"); empty if not stated.
 
 Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
@@ -1263,6 +1267,34 @@ def load_ignored():
 
 
 IGNORED_COUNTRIES = load_ignored()
+
+IGNORED_TOPICS_FILE = os.environ.get("IGNORED_TOPICS_FILE") or "ignored_topics.csv"
+IGNORED_TOPIC_TERMS = []
+
+
+def load_ignored_topics():
+    """Topics/keywords the analyst doesn't want (one per line in ignored_topics.csv).
+    A word matches anywhere it STARTS a word: 'военно-техническ' also matches 'военно-техническому'."""
+    try:
+        with open(IGNORED_TOPICS_FILE, encoding="utf-8-sig") as f:
+            terms = [line.split(";")[0].strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        terms = []
+    terms = [t for t in terms if t and t.lower() not in ("тема или ключевое слово", "topic")]
+    IGNORED_TOPIC_TERMS[:] = terms
+    if not terms:
+        return None
+    return re.compile("|".join(r"(?<![\w-])" + re.escape(t) for t in terms), re.IGNORECASE)
+
+
+IGNORED_TOPICS_RE = load_ignored_topics()
+
+
+def ignored_topic(*texts):
+    if not IGNORED_TOPICS_RE:
+        return ""
+    m = IGNORED_TOPICS_RE.search(" ".join(str(t or "") for t in texts))
+    return m.group(0) if m else ""
 
 
 def is_ignored(value):
@@ -1810,8 +1842,48 @@ def weekly_digest():
 # =============================================================================
 # MAIN
 # =============================================================================
+VAGUE_DATE_RE = re.compile(
+    r"в эти (же )?дни|на днях|недавно|в последнее время|в ближайшее время|скоро|вскоре|"
+    r"these days|recently|lately|soon|in the coming days", re.IGNORECASE)
+TODAY_WORD_RE = re.compile(r"сегодня|today|ныне|сейчас|в настоящее время|now", re.IGNORECASE)
+MONTHS_RU_RE = "|".join(MON_GEN)
+MONTHS_EN = ["january", "february", "march", "april", "may", "june", "july", "august", "september",
+             "october", "november", "december"]
+EXPLICIT_DATE_RE = re.compile(
+    rf"(?<!\d)([0-3]?\d)(?:-?(?:го|е))?\s+({MONTHS_RU_RE})|"
+    rf"({'|'.join(MONTHS_EN)})\s+([0-3]?\d)(?!\d)|(?<!\d)([0-3]?\d)\s+({'|'.join(MONTHS_EN)})", re.IGNORECASE)
+
+
+def explicit_dates(text, ref):
+    """Calendar dates written in the text ('26 ноября', 'November 26'), placed in the year closest to ref."""
+    out = set()
+    for m in EXPLICIT_DATE_RE.finditer(text or ""):
+        try:
+            if m.group(2):
+                d, mon = int(m.group(1)), MON_GEN.index(m.group(2).lower()) + 1
+            elif m.group(3):
+                d, mon = int(m.group(4)), MONTHS_EN.index(m.group(3).lower()) + 1
+            else:
+                d, mon = int(m.group(5)), MONTHS_EN.index(m.group(6).lower()) + 1
+            cands = [dt.date(y, mon, d) for y in (ref.year - 1, ref.year, ref.year + 1)]
+            out.add(min(cands, key=lambda c: abs((c - ref).days)))
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def clean_vague_date(r):
+    """'в эти же дни', 'на днях', 'soon' are not dates: treat the date as unknown."""
+    if VAGUE_DATE_RE.search(r.get("date_text") or "") and not EXPLICIT_DATE_RE.search(r.get("date_text") or ""):
+        r["date_text"], r["date_start"], r["date_end"] = "", {"kind": "unknown"}, None
+
+
 def reject_reason(r, it, w):
     """Deterministic checks on the AI's answer, based on the analyst's rules."""
+    topic = ignored_topic(it["title"], r.get("title_ru"), r.get("summary"), r.get("short_ru"),
+                          " ".join(country_list(r.get("countries"))), r.get("participants_foreign"))
+    if topic:
+        return f"ignored topic: {topic}"
     if not (r.get("participants_ru") or "").strip():
         return "no Russian participant"
     if is_ignored(r.get("countries")):
@@ -1832,6 +1904,12 @@ def reject_reason(r, it, w):
             return "past event, not today"
     if r.get("tense") in ("past", "present") and pub_date_msk(it) < today - dt.timedelta(days=1):
         return "report is not from today"
+    if r.get("tense") in ("past", "present") and not TODAY_WORD_RE.search(r.get("date_text") or ""):
+        # The text names calendar dates, none of them today, and the latest is in the past:
+        # e.g. "состоялась в минувший четверг, 26 ноября" in an article published on the 27th.
+        dates = explicit_dates(it.get("_fulltext") or it.get("text") or "", today)
+        if dates and today not in dates and max(dates) < today:
+            return f"text dates the event to {max(dates).isoformat()}"
     return ""
 
 
@@ -1888,6 +1966,9 @@ def run_once():
         if it.get("keyword_filter") and not prefilter_ok(it):
             prefiltered += 1
             continue
+        if ignored_topic(it["title"]):
+            prefiltered += 1
+            continue
         new_items.append(it)
     db.commit()
     meta_set("tg_known_channels", json.dumps(sorted(known | fresh_channels)))
@@ -1927,6 +2008,8 @@ def run_once():
     for i in range(0, len(shortlist), VERIFY_BATCH):
         batch = shortlist[i:i + VERIFY_BATCH]
         texts = [article_text(it) for it in batch]
+        for it, t in zip(batch, texts):
+            it["_fulltext"] = t
         keep = [i for i, it in enumerate(batch) if it.get("manual") or not is_old_article(it)]
         for i, it in enumerate(batch):
             if i not in keep:
@@ -1936,6 +2019,7 @@ def run_once():
             continue
         today_msk = dt.datetime.now(MSK).date()
         user = (f"TODAY: {today_msk.isoformat()} ({WD_RU[today_msk.weekday()]})\n\n"
+                + (f"IGNORED TOPICS (not relevant): {', '.join(IGNORED_TOPIC_TERMS)}\n\n" if IGNORED_TOPIC_TERMS else "")
                 + feedback_block() + f"RECENT ALERTS:\n{recent_alerts_block()}\n\n" + "\n\n".join(
             f"ITEM {n}{' (ANALYST CHECK)' if it.get('manual') else ''}\nSource: {it['source']}\nPublished: "
             f"{pub_date_msk(it).isoformat()} ({WD_RU[pub_date_msk(it).weekday()]})\n"
@@ -1976,6 +2060,7 @@ def run_once():
                     send(f"🔎 <b>Проверка ссылки:</b> не относится к теме мониторинга.\n{e(r.get('reason_ru'))}",
                          reply_to=it.get("reply_to"))
                 continue
+            clean_vague_date(r)
             if re.fullmatch(r"\s*\d{4}-\d{2}-\d{2}\s*", r.get("date_text") or ""):
                 # a made-up date (usually the publication date) - treat the date as unknown
                 r["date_text"], r["date_start"], r["date_end"] = "", {"kind": "unknown"}, None
