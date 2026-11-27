@@ -803,8 +803,9 @@ RELEVANT only if ALL of these are true:
 4. TIMING: the event is upcoming, under way now, or took place TODAY (publication day). If the text
    shows the event took place before today (e.g. "23 ноября прошло заседание" in an article published
    26 November), it is NOT relevant - even if the article is new.
-NOT relevant: statements, interviews, opinions and policy announcements that do not announce a
-specific visit or meeting (e.g. "Пашинян объявил о прекращении работы пограничников"); business or
+NOT relevant: an article that only COMMENTS on or recalls a meeting that took place earlier (e.g. an
+interview two weeks after talks: "Кушнер назвал Путина великим политиком" about a mid-November meeting);
+statements, interviews, opinions and policy announcements that do not announce a specific visit or meeting (e.g. "Пашинян объявил о прекращении работы пограничников"); business or
 company consultations without a stated visit/meeting of officials (e.g. "Малайзия обсуждает с
 Росатомом меморандум"); culture, singers, artists, art groups, schoolchildren, students, youth groups,
 sports, NGOs and charities (e.g. Red Cross); regional/governor-level contacts; battlefield news;
@@ -858,6 +859,10 @@ describe what the text says with these DATEREF objects (the program computes the
   {"kind":"unknown"}
 tense: "future" if the event is upcoming, "present" if happening now/today, "past" if it already
 took place (fully or partly).
+article_date: if the text shows when the ARTICLE was written (a dateline, "published on...", or a year
+in the text that dates it, e.g. a 2019 article), give it as YYYY-MM-DD; otherwise leave it empty.
+The "Published" date you are given can be wrong for re-published old articles - trust the text.
+Weekday words ("Friday", "в пятницу") refer to the article's own week, which may be years ago.
 location: the place of the EVENT as stated in the text (e.g. "Москва, Россия"); empty if not stated.
 
 Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
@@ -873,6 +878,7 @@ Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
   "short_ru": "короткая метка",
   "status": "announced" | "under_way",
   "tense": "future" | "present" | "past",
+  "article_date": "",
   "participants_ru": "российские участники",
   "participants_foreign": "иностранные участники",
   "announced_by": "кто сообщил о событии, если это не участник",
@@ -928,17 +934,66 @@ def resolve_google_link(item):
         print(f"[google link] could not decode: {ex}")
 
 
+URL_DATE_RE = re.compile(r"(?<!\d)(20\d{2}|19\d{2})[/_-]?(0[1-9]|1[0-2])[/_-]?(0[1-9]|[12]\d|3[01])(?!\d)")
+META_DATE_RE = re.compile(
+    r'(?:article:published_time|datePublished|pubdate|publish[_-]?date|dc\.date|og:published_time)'
+    r'["\']?\s*(?:content|:)\s*=?\s*["\']\s*(\d{4}-\d{2}-\d{2})', re.I)
+
+
+def date_from_url(url):
+    m = URL_DATE_RE.search(urllib.parse.urlparse(url or "").path)
+    if m:
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def date_from_page(page):
+    """The article's own publication date from the page (meta tags / structured data)."""
+    if trafilatura:
+        try:
+            md = trafilatura.extract_metadata(page)
+            if md and md.date:
+                return dt.date.fromisoformat(str(md.date)[:10])
+        except Exception:
+            pass
+    m = META_DATE_RE.search(page)
+    if m:
+        try:
+            return dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
 def article_text(item, limit=4000):
+    """Full text for the AI. Also records the article's REAL publication date (item['article_date']):
+    aggregators such as Google News sometimes show years-old articles with a fresh date."""
     resolve_google_link(item)
     text = item.get("text") or ""
-    if len(text) > 1500 or not trafilatura or "news.google.com" in item["url"] or item["url"].startswith("https://t.me/"):
+    if not item.get("article_date"):
+        item["article_date"] = date_from_url(item["url"])
+    if (len(text) > 1500 and item.get("article_date")) or not trafilatura or "news.google.com" in item["url"] \
+            or item["url"].startswith("https://t.me/"):
         return text[:limit]
     try:
         page = requests.get(item["url"], headers=UA, timeout=20).text
+        item["article_date"] = item.get("article_date") or date_from_page(page)
         extracted = trafilatura.extract(page) or ""
-        return (extracted or text)[:limit]
+        return (extracted if len(extracted) > len(text) else text)[:limit]
     except Exception:
         return text[:limit]
+
+
+def is_old_article(item):
+    """True if the article itself was written more than MAX_AGE_HOURS (rounded up to days) ago."""
+    d = item.get("article_date")
+    if not d:
+        return False
+    max_days = max(1, -(-MAX_AGE_HOURS // 24))
+    return (dt.datetime.now(MSK).date() - d).days > max_days
 
 
 def recent_alerts_block():
@@ -975,7 +1030,10 @@ MON_NOM = ["январь", "февраль", "март", "апрель", "май
 
 
 def pub_date_msk(item):
-    """Publication date of the item in Moscow time; falls back to 'now'."""
+    """Publication date of the item in Moscow time: the article's own date if known, otherwise the
+    date the source reported; falls back to 'now'."""
+    if item.get("article_date"):
+        return item["article_date"]
     p = item.get("published")
     if isinstance(p, dt.datetime):
         if p.tzinfo is None:
@@ -1754,10 +1812,21 @@ def reject_reason(r, it, w):
     if is_ignored(r.get("countries")):
         return "ignored country"
     today = dt.datetime.now(MSK).date()
-    if w["precision"] == "day" and w["end"] and dt.date.fromisoformat(w["end"]) < today:
-        return "event already over"
-    if r.get("tense") == "past" and w["precision"] == "none" and pub_date_msk(it) < today:
-        return "past event, not today"
+    ad = r.get("article_date") or ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ad.strip()):
+        try:
+            if (today - dt.date.fromisoformat(ad.strip())).days > 1:
+                return f"old article ({ad})"
+        except ValueError:
+            pass
+    if w["end"] and dt.date.fromisoformat(w["end"]) < today:
+        return "event already over"            # also 'mid-November', 'last week' etc.
+    if r.get("tense") == "past":
+        # something that already happened is only news if it happened TODAY
+        if not (w["precision"] == "day" and w["end"] and dt.date.fromisoformat(w["end"]) >= today):
+            return "past event, not today"
+    if r.get("tense") in ("past", "present") and pub_date_msk(it) < today - dt.timedelta(days=1):
+        return "report is not from today"
     return ""
 
 
@@ -1852,12 +1921,20 @@ def run_once():
     sent = 0
     for i in range(0, len(shortlist), VERIFY_BATCH):
         batch = shortlist[i:i + VERIFY_BATCH]
+        texts = [article_text(it) for it in batch]
+        keep = [i for i, it in enumerate(batch) if it.get("manual") or not is_old_article(it)]
+        for i, it in enumerate(batch):
+            if i not in keep:
+                print(f"[verify] dropped: old article from {it['article_date']}: {it['title'][:100]}")
+        batch, texts = [batch[i] for i in keep], [texts[i] for i in keep]
+        if not batch:
+            continue
         today_msk = dt.datetime.now(MSK).date()
         user = (f"TODAY: {today_msk.isoformat()} ({WD_RU[today_msk.weekday()]})\n\n"
                 + feedback_block() + f"RECENT ALERTS:\n{recent_alerts_block()}\n\n" + "\n\n".join(
             f"ITEM {n}{' (ANALYST CHECK)' if it.get('manual') else ''}\nSource: {it['source']}\nPublished: "
             f"{pub_date_msk(it).isoformat()} ({WD_RU[pub_date_msk(it).weekday()]})\n"
-            f"URL: {it['url']}\nTitle: {it['title']}\nText: {article_text(it)}"
+            f"URL: {it['url']}\nTitle: {it['title']}\nText: {texts[n]}"
             for n, it in enumerate(batch)))
         res = ask_json(VERIFY_MODEL, VERIFY_PROMPT, user, max_tokens=3500)
 
