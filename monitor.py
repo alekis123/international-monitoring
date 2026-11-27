@@ -790,7 +790,8 @@ VERIFY_PROMPT = """You verify news items for a Russian-speaking analyst who trac
 OF RUSSIAN STATE OFFICIALS WITH FOREIGN STATE OFFICIALS. You get TODAY's date and several numbered
 ITEMS, each with its publication date and (usually) the full article text. Read the full text.
 
-RELEVANT only if ALL of these are true:
+RELEVANT only if ALL of these are true (an event with only Russian participants, e.g. a Russian
+conference with no foreign officials, is NOT relevant; write "" rather than "нет" for an empty field):
 1. RUSSIA IS ONE OF THE SIDES: a named Russian state official or an official Russian state delegation
    takes part (president, PM, deputy PMs, ministers and deputies, heads of federal agencies and
    services, Kremlin officials, presidential envoys, Security Council officials, Federal Assembly
@@ -1883,14 +1884,49 @@ def find_same_event(r, w):
     return None
 
 
+EMPTY_RE = re.compile(r"^\s*(нет|не указан[оаы]?|отсутству\w*|неизвестн\w*|не назван[оаы]?|—|-|none|n/?a|no)?\s*\.?\s*$",
+                      re.IGNORECASE)
+
+
+def filled(value):
+    """'нет', 'не указано', '—' etc. count as empty."""
+    return not EMPTY_RE.match(str(value or ""))
+
+
+def _cyrillic_share(text):
+    letters = re.findall(r"[^\W\d_]", text or "")
+    return sum(1 for ch in letters if "а" <= ch.lower() <= "я" or ch.lower() == "ё") / max(1, len(letters))
+
+
+def supports(r, it):
+    """Does THIS article actually contain what the AI reported? Returns (names_ok, date_ok).
+    Guards against the AI mixing up items in a batch (e.g. a date from one article attached to the
+    link of another). Checks are skipped where the article language makes them impossible."""
+    text = f"{it['title']} {it.get('_fulltext') or it.get('text') or ''}"
+    low = text.lower()
+    russian_text = _cyrillic_share(text) > 0.3
+    names_ok = True
+    if russian_text:
+        keys = name_keys(r.get("participants_ru"))
+        if keys:
+            names_ok = any(re.search(r"(?<![а-яёa-z])" + re.escape(k), low) for k in keys)
+    date_ok = True
+    stated = explicit_dates(r.get("date_text") or "", dt.datetime.now(MSK).date())
+    if stated and (russian_text or EXPLICIT_DATE_RE.search(text)):
+        date_ok = bool(stated & explicit_dates(text, dt.datetime.now(MSK).date()))
+    return names_ok, date_ok
+
+
 def reject_reason(r, it, w):
     """Deterministic checks on the AI's answer, based on the analyst's rules."""
     topic = ignored_topic(it["title"], r.get("title_ru"), r.get("summary"), r.get("short_ru"),
                           " ".join(country_list(r.get("countries"))), r.get("participants_foreign"))
     if topic:
         return f"ignored topic: {topic}"
-    if not (r.get("participants_ru") or "").strip():
+    if not filled(r.get("participants_ru")):
         return "no Russian participant"
+    if not country_list(r.get("countries")) or not filled(r.get("participants_foreign")):
+        return "no foreign side (domestic event)"
     if is_ignored(r.get("countries")):
         return "ignored country"
     today = dt.datetime.now(MSK).date()
@@ -2059,6 +2095,19 @@ def run_once():
                 continue
             it = batch[n]
             answered.add(n)
+            if r.get("relevant") is not False and not it.get("manual"):
+                names_ok, date_ok = supports(r, it)
+                if not (names_ok and date_ok):
+                    alt = next((x for x in batch if x is not it and all(supports(r, x))), None)
+                    if alt:
+                        print(f"[verify] answer matched another article, switching source: {alt['title'][:80]}")
+                        it = alt
+                    elif names_ok:
+                        print(f"[verify] date '{r.get('date_text')}' not found in the article - date ignored")
+                        r["date_text"], r["date_start"], r["date_end"] = "", {"kind": "unknown"}, None
+                    else:
+                        print(f"[verify] dropped: article does not mention the participants: {it['title'][:80]}")
+                        continue
             if r.get("relevant") is False:
                 print(f"[verify] not relevant: {it['title'][:100]} — {r.get('reason_ru', '')}")
                 if it.get("manual"):
