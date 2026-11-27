@@ -4,3 +4,4 @@ requests
 trafilatura
 telethon
 beautifulsoup4
+googlenewsdecoder

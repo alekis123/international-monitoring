@@ -269,7 +269,8 @@ CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, alert
 _ALERT_COLS = {"msg_id": "INTEGER", "countries": "TEXT", "officials": "TEXT", "direction": "TEXT",
                "location": "TEXT", "date_start": "TEXT", "date_end": "TEXT", "date_precision": "TEXT",
                "date_label": "TEXT", "date_text": "TEXT", "status": "TEXT", "title_ru": "TEXT",
-               "short_ru": "TEXT", "source": "TEXT", "updates": "TEXT", "vote": "TEXT"}
+               "short_ru": "TEXT", "source": "TEXT", "updates": "TEXT", "vote": "TEXT",
+               "participants_ru": "TEXT", "participants_foreign": "TEXT"}
 _existing = {r[1] for r in db.execute("PRAGMA table_info(alerts)").fetchall()}
 for _c, _t in _ALERT_COLS.items():
     if _c not in _existing:
@@ -643,6 +644,7 @@ else:
 SCREEN_BATCH = int(os.environ.get("SCREEN_BATCH") or "150")  # items per AI call (headline + lead)
 VERIFY_BATCH = int(os.environ.get("VERIFY_BATCH") or "8")    # articles per AI call
 SAFETY_NET_MAX = int(os.environ.get("SAFETY_NET_MAX") or "40")  # extra items per run sent to verification
+MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS") or "24")    # ignore news published earlier than this
 AI_PAUSE = float(os.environ.get("AI_PAUSE_SECONDS") or "0")  # pause between calls (free tiers: 4-6)
 
 _ai_down = False  # set when the AI quota is exhausted, so the rest of the run uses keywords
@@ -784,47 +786,68 @@ the word "visit" (e.g. "Лавров примет участие в Дохийс
 When in doubt, INCLUDE it. Missing a real event is far worse than a false positive.
 Reply with ONLY JSON: {"keep": [numbers]}"""
 
-VERIFY_PROMPT = """You verify news items for a Russian-speaking analyst tracking visits and meetings
-between Russian government officials and officials of other countries. You get several numbered ITEMS,
-each with its publication date.
+VERIFY_PROMPT = """You verify news items for a Russian-speaking analyst who tracks VISITS AND MEETINGS
+OF RUSSIAN STATE OFFICIALS WITH FOREIGN STATE OFFICIALS. You get TODAY's date and several numbered
+ITEMS, each with its publication date and (usually) the full article text. Read the full text.
 
-An item is RELEVANT if it announces or reports a visit/trip/meeting/talks/commission/dialogue that is
-UPCOMING or UNDER WAY (not fully concluded), involving the officials below. This INCLUDES a Russian
-official's participation in a forum, summit, conference, session or international-organization event
-abroad (e.g. Lavrov at the Doha Forum in Qatar = relevant, country Катар), and foreign officials
-attending events in Russia. Meetings "on the sidelines" count too. Involving:
-- a Russian state official (president, PM, deputy PMs, ministers, deputy ministers, heads of federal
-  agencies, Kremlin staff, presidential envoys, ambassadors-at-large, Federal Assembly leadership,
-  central bank leadership, heads of major state corporations acting officially), AND
-- officials of any foreign country or international organization; in either direction.
-NOT relevant: events that already ended, purely domestic trips, sports/culture tours, pure speculation,
-battlefield news.
+RELEVANT only if ALL of these are true:
+1. RUSSIA IS ONE OF THE SIDES: a named Russian state official or an official Russian state delegation
+   takes part (president, PM, deputy PMs, ministers and deputies, heads of federal agencies and
+   services, Kremlin officials, presidential envoys, Security Council officials, Federal Assembly
+   leaders and official delegations, Bank of Russia, heads of state corporations such as Rosatom
+   acting officially, ambassadors). Talks between two OTHER countries (e.g. Azerbaijan-Armenia) are
+   NOT relevant, even if the article mentions Russia.
+2. THE OTHER SIDE is a foreign state official/delegation or an international organization.
+3. It is a concrete visit, trip, meeting, talks, consultations, intergovernmental commission,
+   forum/summit/conference participation, etc. A Russian official's trip to a forum abroad counts.
+4. TIMING: the event is upcoming, under way now, or took place TODAY (publication day). If the text
+   shows the event took place before today (e.g. "23 ноября прошло заседание" in an article published
+   26 November), it is NOT relevant - even if the article is new.
+NOT relevant: statements, interviews, opinions and policy announcements that do not announce a
+specific visit or meeting (e.g. "Пашинян объявил о прекращении работы пограничников"); business or
+company consultations without a stated visit/meeting of officials (e.g. "Малайзия обсуждает с
+Росатомом меморандум"); culture, singers, artists, art groups, schoolchildren, students, youth groups,
+sports, NGOs and charities (e.g. Red Cross); regional/governor-level contacts; battlefield news;
+speculation.
 
-You also get RECENT ALERTS already sent (with their known date and status). If an item is about the
-same event as one of them, set duplicate_of to that alert id and set change_type:
-  "date_confirmed" - the alert had no exact date (or only a week/month) and this item gives the day;
-  "date_changed"   - the alert had an exact date and this item clearly gives a DIFFERENT date;
-  "postponed"      - the item says the event is postponed/delayed (with or without a new date);
-  "cancelled"      - the item says the event is cancelled / will not take place;
-  "other_update"   - materially new facts (participants, location, agenda) - describe them in new_info;
-  "none"           - nothing new.
-For duplicates still fill the date fields with what THIS item says.
-Items about postponement or cancellation of an event NOT in recent alerts are relevant too
-(use status "announced" and say so in the summary).
+PARTICIPANTS: list only people who TAKE PART in the event, with names and positions if the text
+gives them. Someone who merely announced or commented on the event (e.g. a spokesman, or an envoy
+who "said a delegation may come") is NOT a participant - put them in announced_by instead.
+participants_ru: the Russian participants (name + position, as precisely as the text allows, e.g.
+"Александр Венедиктов, заместитель секретаря Совета Безопасности РФ"). Must not be empty for a
+relevant item - if no Russian participant is identifiable, the item is not relevant.
+participants_foreign: the foreign participants (name + position, or the position only).
+
+You also get RECENT ALERTS already sent (with date, participants and status). If an item is about the
+SAME event as one of them, set duplicate_of to that alert id and set change_type:
+  "date_confirmed"     - the alert had no exact date (or only a week/month) and this item gives the day;
+  "date_changed"       - the alert had an exact date and this item clearly gives a DIFFERENT date;
+  "postponed"          - the item says the event is postponed (with or without a new date);
+  "cancelled"          - the item says the event is cancelled / will not take place;
+  "participants_added" - the item NAMES participants who were not known in the alert (e.g. the alert
+                         said "делегация Минфина", now we learn the deputy minister's name). Put ONLY the
+                         newly named people in new_info;
+  "none"               - anything else: details of the agenda, results or atmosphere of the talks,
+                         ceremonies, site visits, quotes, or a repeat of the same facts. These are NOT
+                         worth a message.
+Do not invent contradictions: "the invitation stands" and "I don't know if he accepted" are compatible.
+Items about postponement or cancellation of an event NOT in recent alerts are relevant too.
 If several items in this batch describe the same event, return it ONCE (most informative item).
 
-If ANALYST FEEDBACK is provided, follow it: avoid alerts similar to ones marked NOT useful.
+If ANALYST FEEDBACK is provided, follow it.
 
 Items marked "ANALYST CHECK" were sent by the analyst for a manual check: ALWAYS return them, with
 "relevant": true or false and "reason_ru" (one sentence in Russian explaining the decision).
 
-LANGUAGE: write summary, new_info, officials, countries, location, title_ru and short_ru IN RUSSIAN
-(standard Russian spelling of names and countries, e.g. "Антон Силуанов, министр финансов РФ").
+LANGUAGE: everything you write IN RUSSIAN (standard Russian spelling of names and countries).
 title_ru = the item's headline translated into natural Russian (if already Russian, copy it as is).
 short_ru = a very short Russian label, max 8 words, e.g. "визит главы МИД Вьетнама в Москву".
+countries = list of the OTHER countries / organizations, WITHOUT Russia, e.g. ["Китай"] or ["МАГАТЭ"].
 
-DATES - do NOT calculate calendar dates yourself for weekdays or relative words. Only describe what
-the text says, using these DATEREF objects; the program computes the actual date:
+DATES - the date of the EVENT, never the publication date. If the text does not say when the event
+happens, use {"kind":"unknown"} and leave date_text empty. date_text must be words quoted from the
+article, never a date you made up. Do NOT calculate calendar dates for weekdays or relative words;
+describe what the text says with these DATEREF objects (the program computes the date):
   {"kind":"absolute","day":24,"month":11,"year":2026}   (year null if the text gives none)
   {"kind":"weekday","weekday":"tuesday","modifier":"none"}
        modifier: "this" (this week / в этот вторник), "next" (next week's / в следующий вторник),
@@ -833,8 +856,9 @@ the text says, using these DATEREF objects; the program computes the actual date
   {"kind":"week","modifier":"this"|"next"}   ("this week", "next week")
   {"kind":"month","month":12,"year":null,"part":"early"|"mid"|"late"|"whole"}
   {"kind":"unknown"}
-tense: "future" if the text describes the event as upcoming, "present" if happening now/today,
-"past" if it already took place (fully or partly).
+tense: "future" if the event is upcoming, "present" if happening now/today, "past" if it already
+took place (fully or partly).
+location: the place of the EVENT as stated in the text (e.g. "Москва, Россия"); empty if not stated.
 
 Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
 {"results": [
@@ -843,17 +867,19 @@ Return ONLY relevant items (plus every ANALYST CHECK item), as ONLY JSON:
   "reason_ru": "",
   "confidence": "high" | "medium",
   "duplicate_of": alert id number or null,
-  "change_type": "none" | "date_confirmed" | "date_changed" | "postponed" | "cancelled" | "other_update",
+  "change_type": "none" | "date_confirmed" | "date_changed" | "postponed" | "cancelled" | "participants_added",
   "new_info": "",
   "title_ru": "заголовок на русском",
   "short_ru": "короткая метка",
   "status": "announced" | "under_way",
   "tense": "future" | "present" | "past",
-  "officials": "имена и должности",
-  "countries": "страна/страны или организации",
+  "participants_ru": "российские участники",
+  "participants_foreign": "иностранные участники",
+  "announced_by": "кто сообщил о событии, если это не участник",
+  "countries": ["страна или организация"],
   "direction": "outbound" | "inbound" | "elsewhere",
   "location": "город, страна",
-  "date_text": "the exact words about timing, as written in the article (original language), or empty",
+  "date_text": "",
   "date_start": DATEREF,
   "date_end": DATEREF or null,
   "summary": "одно-два предложения на русском"}
@@ -887,9 +913,25 @@ def screen(items):
     return keep
 
 
-def article_text(item, limit=2500):
+def resolve_google_link(item):
+    """Google News items point to news.google.com; find the real article address so the AI can read
+    the full text (dates, places, names) and the alert links to the original site."""
+    if "news.google.com" not in item.get("url", "") or item.get("_resolved"):
+        return
+    item["_resolved"] = True
+    try:
+        from googlenewsdecoder import gnewsdecoder
+        res = gnewsdecoder(item["url"], interval=1)
+        if res.get("success") or res.get("status"):
+            item["url"] = res["decoded_url"]
+    except Exception as ex:
+        print(f"[google link] could not decode: {ex}")
+
+
+def article_text(item, limit=4000):
+    resolve_google_link(item)
     text = item.get("text") or ""
-    if len(text) > 400 or not trafilatura or "news.google.com" in item["url"]:
+    if len(text) > 1500 or not trafilatura or "news.google.com" in item["url"] or item["url"].startswith("https://t.me/"):
         return text[:limit]
     try:
         page = requests.get(item["url"], headers=UA, timeout=20).text
@@ -901,10 +943,11 @@ def article_text(item, limit=2500):
 
 def recent_alerts_block():
     cutoff = time.time() - 21 * 86400
-    rows = db.execute("SELECT id, summary, event_date, date_label, status FROM alerts "
+    rows = db.execute("SELECT id, summary, event_date, date_label, status, participants_ru, participants_foreign FROM alerts "
                       "WHERE ts > ? AND COALESCE(status,'active') != 'unverified' ORDER BY id DESC LIMIT 150",
                       (cutoff,)).fetchall()
     return "\n".join(f"[{r['id']}] {r['summary']} | known date: {r['date_label'] or r['event_date']} "
+                     f"| participants: {r['participants_ru'] or '?'} / {r['participants_foreign'] or '?'} "
                      f"| status: {r['status'] or 'active'}" for r in rows) or "(none)"
 
 
@@ -1076,11 +1119,97 @@ DIRECTION_RU = {
 WD_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 MON_SHORT = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 
-FEEDBACK_ON = (os.environ.get("FEEDBACK_BUTTONS") or "on").strip().lower() not in ("off", "0", "no", "false", "нет")
+# 👍/👎 buttons are switched off: the bot is not online between runs, so Telegram showed an endless
+# "loading" after a click. Buttons already sent are removed automatically at the next run.
+FEEDBACK_ON = False
 
 
 def e(s):
     return html.escape(str(s or ""), quote=False)
+
+
+FLAGS = {
+    "китай": "🇨🇳", "кнр": "🇨🇳", "гонконг": "🇭🇰", "тайвань": "🇹🇼", "макао": "🇲🇴", "вьетнам": "🇻🇳",
+    "камбоджа": "🇰🇭", "таиланд": "🇹🇭", "мьянма": "🇲🇲", "япония": "🇯🇵", "республика корея": "🇰🇷",
+    "южная корея": "🇰🇷", "корея": "🇰🇷", "кндр": "🇰🇵", "северная корея": "🇰🇵", "армения": "🇦🇲",
+    "индонезия": "🇮🇩", "сингапур": "🇸🇬", "лаос": "🇱🇦", "малайзия": "🇲🇾", "монголия": "🇲🇳",
+    "бразилия": "🇧🇷", "юар": "🇿🇦", "южно-африканская": "🇿🇦", "нигерия": "🇳🇬", "мексика": "🇲🇽",
+    "турция": "🇹🇷", "азербайджан": "🇦🇿", "бахрейн": "🇧🇭", "катар": "🇶🇦", "кувейт": "🇰🇼", "оаэ": "🇦🇪",
+    "объединённые арабские": "🇦🇪", "объединенные арабские": "🇦🇪", "оман": "🇴🇲", "саудовская": "🇸🇦",
+    "египет": "🇪🇬", "марокко": "🇲🇦", "алжир": "🇩🇿", "гайана": "🇬🇾", "ямайка": "🇯🇲", "венгрия": "🇭🇺",
+    "словакия": "🇸🇰", "сербия": "🇷🇸", "белоруссия": "🇧🇾", "беларусь": "🇧🇾", "казахстан": "🇰🇿",
+    "узбекистан": "🇺🇿", "туркменистан": "🇹🇲", "туркмения": "🇹🇲", "киргизия": "🇰🇬", "кыргызстан": "🇰🇬",
+    "таджикистан": "🇹🇯", "молдавия": "🇲🇩", "молдова": "🇲🇩", "гана": "🇬🇭", "мадагаскар": "🇲🇬",
+    "гвинея-бисау": "🇬🇼", "гвинея": "🇬🇳", "индия": "🇮🇳", "пакистан": "🇵🇰", "афганистан": "🇦🇫",
+    "иран": "🇮🇷", "ирак": "🇮🇶", "сирия": "🇸🇾", "израиль": "🇮🇱", "палестина": "🇵🇸", "иордания": "🇯🇴",
+    "ливан": "🇱🇧", "ливия": "🇱🇾", "тунис": "🇹🇳", "судан": "🇸🇩", "эфиопия": "🇪🇹", "кения": "🇰🇪",
+    "танзания": "🇹🇿", "уганда": "🇺🇬", "мали": "🇲🇱", "буркина-фасо": "🇧🇫", "нигер": "🇳🇪", "чад": "🇹🇩",
+    "цар": "🇨🇫", "центральноафриканская": "🇨🇫", "конго": "🇨🇬", "ангола": "🇦🇴", "мозамбик": "🇲🇿",
+    "зимбабве": "🇿🇼", "сенегал": "🇸🇳", "эритрея": "🇪🇷", "сахарская": "🇪🇭", "садр": "🇪🇭",
+    "грузия": "🇬🇪", "абхазия": "🏳️", "южная осетия": "🏳️", "украина": "🇺🇦", "сша": "🇺🇸",
+    "соединённые штаты": "🇺🇸", "соединенные штаты": "🇺🇸", "канада": "🇨🇦", "великобритания": "🇬🇧",
+    "франция": "🇫🇷", "германия": "🇩🇪", "италия": "🇮🇹", "испания": "🇪🇸", "австрия": "🇦🇹",
+    "швейцария": "🇨🇭", "ватикан": "🇻🇦", "греция": "🇬🇷", "кипр": "🇨🇾", "болгария": "🇧🇬",
+    "румыния": "🇷🇴", "польша": "🇵🇱", "финляндия": "🇫🇮", "норвегия": "🇳🇴", "швеция": "🇸🇪",
+    "босния": "🇧🇦", "республика сербская": "🇧🇦", "черногория": "🇲🇪", "северная македония": "🇲🇰",
+    "куба": "🇨🇺", "венесуэла": "🇻🇪", "никарагуа": "🇳🇮", "боливия": "🇧🇴", "аргентина": "🇦🇷",
+    "чили": "🇨🇱", "колумбия": "🇨🇴", "перу": "🇵🇪", "эквадор": "🇪🇨", "уругвай": "🇺🇾", "парагвай": "🇵🇾",
+    "бангладеш": "🇧🇩", "шри-ланка": "🇱🇰", "непал": "🇳🇵", "филиппины": "🇵🇭", "австралия": "🇦🇺",
+    "новая зеландия": "🇳🇿", "бруней": "🇧🇳", "восточный тимор": "🇹🇱", "мальдивы": "🇲🇻",
+}
+ORG_WORDS = ("оон", "магатэ", "еаэс", "шос", "брикс", "снг", "одкб", "асеан", "атэс", "g20", "g7", "оопек",
+             "опек", "ес", "евросоюз", "нато", "африканский союз", "лига арабских", "оис", "юнеско", "вто",
+             "мвф", "всемирный банк", "мккк", "форум", "организация")
+
+
+def country_list(value):
+    """AI 'countries' (list or string) -> list of names without Russia."""
+    items = value if isinstance(value, list) else re.split(r"[,;/]| и ", str(value or ""))
+    out = []
+    for c in items:
+        c = re.sub(r"\s+", " ", str(c)).strip(" .")
+        if not c or re.fullmatch(r"(россия|рф|российская федерация)", c, re.I):
+            continue
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def flag(name):
+    low = name.lower()
+    for key in sorted(FLAGS, key=len, reverse=True):
+        if low.startswith(key) or f" {key}" in f" {low}":
+            return FLAGS[key]
+    return "🌐" if any(w in low for w in ORG_WORDS) else "🏳️"
+
+
+def countries_line(value):
+    """'🇷🇺 Россия ⇄ 🇨🇳 Китай'"""
+    others = country_list(value)
+    if not others:
+        return "🇷🇺 Россия"
+    return "🇷🇺 Россия ⇄ " + ", ".join(f"{flag(c)} {e(c)}" for c in others)
+
+
+IGNORED_FILE = os.environ.get("IGNORED_COUNTRIES_FILE") or "ignored_countries.csv"
+
+
+def load_ignored():
+    """Countries the analyst doesn't care about (one per line in ignored_countries.csv)."""
+    try:
+        with open(IGNORED_FILE, encoding="utf-8-sig") as f:
+            names = [line.split(";")[0].strip().lower() for line in f if line.strip()]
+        return {n for n in names if n and n not in ("страна", "country")}
+    except FileNotFoundError:
+        return set()
+
+
+IGNORED_COUNTRIES = load_ignored()
+
+
+def is_ignored(value):
+    others = [c.lower() for c in country_list(value)]
+    return bool(others) and all(any(c.startswith(i) for i in IGNORED_COUNTRIES) for c in others)
 
 
 def link(url, text):
@@ -1164,9 +1293,11 @@ def register_commands():
 
 def alert_message_from_row(row):
     """Rebuild an alert from the database (for alerts that were not delivered)."""
-    lines = [f"🛬 <b>Анонс визита</b>" + (f": Россия ⇄ {e(row['countries'])}" if row["countries"] else ""), "",
+    lines = [f"🛬 <b>Анонс визита</b>" + (f": {countries_line(row['countries'])}" if row["countries"] else ""), "",
              e(row["summary"]), ""]
-    if row["officials"]:
+    if row["participants_ru"] or row["participants_foreign"]:
+        lines += participant_lines(row["participants_ru"], row["participants_foreign"], row["countries"])
+    elif row["officials"]:
         lines.append(f"👤 <b>Кто:</b> {e(row['officials'])}")
     if row["direction"]:
         lines.append(f"🧭 <b>Направление:</b> {e(DIRECTION_RU.get(row['direction'], row['direction']))}")
@@ -1214,23 +1345,40 @@ def fb_markup(alert_id, vote=None):
     ]]}
 
 
+def participant_lines(p_ru, p_foreign, countries):
+    lines = []
+    if p_ru:
+        lines.append(f"👤 <b>🇷🇺 Россия:</b> {e(p_ru)}")
+    if p_foreign:
+        others = country_list(countries)
+        label = f"{flag(others[0])} {e(others[0])}" if len(others) == 1 else "Другая сторона"
+        lines.append(f"👤 <b>{label}:</b> {e(p_foreign)}")
+    return lines
+
+
 def alert_message(r, it, w):
-    status = "🟢 <b>Проходит сейчас</b>" if r.get("status") == "under_way" else "🛬 <b>Анонс визита</b>"
+    if r.get("tense") == "past":
+        status = "✅ <b>Состоялось сегодня</b>"
+    elif r.get("status") == "under_way" or r.get("tense") == "present":
+        status = "🟢 <b>Проходит сейчас</b>"
+    else:
+        status = "🛬 <b>Анонс визита</b>"
+    when = when_with_text(w)
+    if w["precision"] == "none" and status != "🛬 <b>Анонс визита</b>":
+        when = f"{fmt_day(pub_date_msk(it))} (дата публикации)"
     lines = []
     if r.get("confidence") == "medium":
         lines.append("⚠️ <i>Не подтверждено — требует проверки</i>")
+    lines += [f"{status}: {countries_line(r.get('countries'))}", "", e(r.get("summary")), ""]
+    lines += participant_lines(r.get("participants_ru"), r.get("participants_foreign"), r.get("countries"))
     lines += [
-        f"{status}: Россия ⇄ {e(r.get('countries'))}",
-        "",
-        e(r.get("summary")),
-        "",
-        f"👤 <b>Кто:</b> {e(r.get('officials'))}",
         f"🧭 <b>Направление:</b> {e(DIRECTION_RU.get(r.get('direction'), r.get('direction')))}",
-        f"📍 <b>Где:</b> {e(r.get('location'))}",
-        f"📅 <b>Когда:</b> {e(when_with_text(w))}",
-        "",
-        f"🔗 {link(it['url'], (r.get('title_ru') or it['title'])[:200])} — {e(it['source'])}",
+        f"📍 <b>Где:</b> {e(r.get('location') or 'не указано')}",
+        f"📅 <b>Когда:</b> {e(when)}",
     ]
+    if r.get("announced_by"):
+        lines.append(f"🗣 <b>Сообщил:</b> {e(r['announced_by'])}")
+    lines += ["", f"🔗 {link(it['url'], (r.get('title_ru') or it['title'])[:200])} — {e(it['source'])}"]
     return "\n".join(lines)
 
 
@@ -1246,11 +1394,14 @@ def create_alert(r, it, w):
         "INSERT INTO alerts (ts, summary, event_date, url, countries, officials, direction, location, "
         "date_start, date_end, date_precision, date_label, date_text, status, title_ru, short_ru, source, updates) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (time.time(), r.get("summary", ""), w["start"] or w["label"], it["url"], r.get("countries", ""),
-         r.get("officials", ""), r.get("direction", ""), r.get("location", ""), w["start"], w["end"],
+        (time.time(), r.get("summary", ""), w["start"] or w["label"], it["url"], ", ".join(country_list(r.get("countries"))),
+         "; ".join(x for x in (r.get("participants_ru"), r.get("participants_foreign")) if x),
+         r.get("direction", ""), r.get("location", ""), w["start"], w["end"],
          w["precision"], w["label"], w["text"], "active", r.get("title_ru") or it["title"],
          r.get("short_ru") or "", it["source"], ""))
     aid = cur.lastrowid
+    db.execute("UPDATE alerts SET participants_ru=?, participants_foreign=? WHERE id=?",
+               (r.get("participants_ru", ""), r.get("participants_foreign", ""), aid))
     db.commit()
     mid = send(alert_message(r, it, w), markup=fb_markup(aid) if FEEDBACK_ON else None)
     db.execute("UPDATE alerts SET msg_id=? WHERE id=?", (mid, aid))
@@ -1281,8 +1432,8 @@ def handle_update(row, r, it, w):
         kind = "confirmed"
     elif new_day and old_prec == "day" and ct == "date_changed" and date_differs:
         kind = "changed"
-    elif ct in ("other_update", "date_changed") and r.get("new_info"):
-        kind = "info"
+    elif ct == "participants_added" and r.get("new_info"):
+        kind = "participants"
     else:
         return
     if kind == "cancelled" and row["status"] == "cancelled":
@@ -1292,7 +1443,7 @@ def handle_update(row, r, it, w):
     old_l = e(old_label)
     headers = {"confirmed": "📅 <b>Дата подтверждена</b>", "changed": "🔁 <b>Дата изменена</b>",
                "postponed": "⏸ <b>Визит отложен</b>", "cancelled": "❌ <b>Визит отменён</b>",
-               "info": "🔄 <b>Новые сведения</b>"}
+               "participants": "👥 <b>Уточнён состав участников</b>"}
     if kind == "confirmed":
         prev = " без точной даты" if old_prec == "none" else f" (ориентировочно: {old_l})"
         body = f"Этот визит был анонсирован ранее{prev}. Теперь дата подтверждена: {new_label}."
@@ -1305,11 +1456,13 @@ def handle_update(row, r, it, w):
     elif kind == "cancelled":
         body = f"Этот визит был анонсирован ранее (дата: {old_l}). Теперь сообщается об отмене."
     else:
-        body = "Этот визит был анонсирован ранее. Появились новые сведения."
+        body = "Этот визит был анонсирован ранее. Стали известны новые участники."
 
-    lines = [f"{headers[kind]}: Россия ⇄ {e(row['countries'] or r.get('countries'))}", "", body]
-    if r.get("new_info"):
+    lines = [f"{headers[kind]}: {countries_line(row['countries'] or r.get('countries'))}", "", body]
+    if r.get("new_info") and kind != "participants":
         lines += ["", f"ℹ️ {e(r['new_info'])}"]
+    elif kind == "participants":
+        lines += ["", f"👤 {e(r['new_info'])}"]
     lines += ["",
               f"<blockquote><b>Исходное оповещение:</b>\n{e(row['summary'])}\nКогда: {old_l}</blockquote>",
               f"🔗 {link(it['url'], (r.get('title_ru') or it['title'])[:200])} — {e(it['source'])}"]
@@ -1328,6 +1481,9 @@ def handle_update(row, r, it, w):
         note += f" — {r['new_info']}"
     db.execute("UPDATE alerts SET status=?, updates=COALESCE(updates,'') || ? || ' | ' WHERE id=?",
                (status, note, row["id"]))
+    if kind == "participants":
+        db.execute("UPDATE alerts SET participants_ru = TRIM(COALESCE(participants_ru,'') || '; ' || ?, '; ') "
+                   "WHERE id=?", (r["new_info"], row["id"]))
     db.commit()
 
 
@@ -1488,7 +1644,9 @@ def short_day(iso):
 
 def digest_line(row):
     label = row["short_ru"] or row["title_ru"] or row["summary"]
-    return f"• {e(row['countries'])} — {link(row['url'], label)}"
+    others = country_list(row["countries"])
+    who = ", ".join(f"{flag(c)} {e(c)}" for c in others) or "🇷🇺"
+    return f"• {who} — {link(row['url'], label)}"
 
 
 def build_digest(today):
@@ -1589,6 +1747,20 @@ def weekly_digest():
 # =============================================================================
 # MAIN
 # =============================================================================
+def reject_reason(r, it, w):
+    """Deterministic checks on the AI's answer, based on the analyst's rules."""
+    if not (r.get("participants_ru") or "").strip():
+        return "no Russian participant"
+    if is_ignored(r.get("countries")):
+        return "ignored country"
+    today = dt.datetime.now(MSK).date()
+    if w["precision"] == "day" and w["end"] and dt.date.fromisoformat(w["end"]) < today:
+        return "event already over"
+    if r.get("tense") == "past" and w["precision"] == "none" and pub_date_msk(it) < today:
+        return "past event, not today"
+    return ""
+
+
 def run_once():
     global WINDOW_HOURS
     first_run = meta_get("initialized") is None
@@ -1626,7 +1798,7 @@ def run_once():
         print(f"[telegram] new channels, recording existing posts silently: {len(fresh_channels)}")
 
     # Dedupe by URL and by normalized headline (same story across outlets/sources)
-    new_items, now, prefiltered = [], time.time(), 0
+    new_items, now, prefiltered, too_old = [], time.time(), 0, 0
     for it in collected:
         keys = [h("u:" + it["uid"]), h("t:" + norm_title(it["title"]))]
         if any(db.execute("SELECT 1 FROM seen WHERE h=?", (k,)).fetchone() for k in keys):
@@ -1635,13 +1807,18 @@ def run_once():
             db.execute("INSERT OR IGNORE INTO seen (h, ts) VALUES (?, ?)", (k, now))
         if not it["title"].strip() or it.get("channel") in fresh_channels:
             continue
+        pub = it.get("published")
+        if isinstance(pub, dt.datetime) and (dt.datetime.now(UTC) - pub.astimezone(UTC)).total_seconds() > MAX_AGE_HOURS * 3600:
+            too_old += 1
+            continue
         if it.get("keyword_filter") and not prefilter_ok(it):
             prefiltered += 1
             continue
         new_items.append(it)
     db.commit()
     meta_set("tg_known_channels", json.dumps(sorted(known | fresh_channels)))
-    print(f"New items: {len(new_items)} (skipped by keyword prefilter: {prefiltered})")
+    print(f"New items: {len(new_items)} (skipped by keyword prefilter: {prefiltered}; "
+          f"published more than {MAX_AGE_HOURS} h ago: {too_old})")
 
     if first_run:
         print("First run: recorded existing items, no alerts sent.")
@@ -1675,7 +1852,9 @@ def run_once():
     sent = 0
     for i in range(0, len(shortlist), VERIFY_BATCH):
         batch = shortlist[i:i + VERIFY_BATCH]
-        user = (feedback_block() + f"RECENT ALERTS:\n{recent_alerts_block()}\n\n" + "\n\n".join(
+        today_msk = dt.datetime.now(MSK).date()
+        user = (f"TODAY: {today_msk.isoformat()} ({WD_RU[today_msk.weekday()]})\n\n"
+                + feedback_block() + f"RECENT ALERTS:\n{recent_alerts_block()}\n\n" + "\n\n".join(
             f"ITEM {n}{' (ANALYST CHECK)' if it.get('manual') else ''}\nSource: {it['source']}\nPublished: "
             f"{pub_date_msk(it).isoformat()} ({WD_RU[pub_date_msk(it).weekday()]})\n"
             f"URL: {it['url']}\nTitle: {it['title']}\nText: {article_text(it)}"
@@ -1715,9 +1894,17 @@ def run_once():
                     send(f"🔎 <b>Проверка ссылки:</b> не относится к теме мониторинга.\n{e(r.get('reason_ru'))}",
                          reply_to=it.get("reply_to"))
                 continue
+            if re.fullmatch(r"\s*\d{4}-\d{2}-\d{2}\s*", r.get("date_text") or ""):
+                # a made-up date (usually the publication date) - treat the date as unknown
+                r["date_text"], r["date_start"], r["date_end"] = "", {"kind": "unknown"}, None
             w = resolve_when(r, it)
             dup = r.get("duplicate_of")
             row = db.execute("SELECT * FROM alerts WHERE id=?", (dup,)).fetchone() if isinstance(dup, int) else None
+            if not row and not it.get("manual"):
+                why = reject_reason(r, it, w)
+                if why:
+                    print(f"[verify] dropped by rule ({why}): {it['title'][:100]}")
+                    continue
             print(f"[verify] RELEVANT{' (already alerted #' + str(dup) + ')' if row else ''}: {it['title'][:100]}")
             if row:
                 handle_update(row, r, it, w)
